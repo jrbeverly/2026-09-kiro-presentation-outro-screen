@@ -1,0 +1,921 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kiro Plaza</title>
+<style>
+  html,body{margin:0;height:100%;background:#090314;overflow:hidden}
+  #v{position:fixed;inset:0;margin:auto;
+     width:min(100vw,calc(100vh*16/9));height:min(100vh,calc(100vw*9/16));
+     display:block;image-rendering:auto}
+  #dbg{position:fixed;left:8px;top:8px;margin:0;padding:8px 10px;z-index:9;
+       font:13px/1.45 "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+       color:rgba(217,194,255,.85);background:rgba(9,3,20,.6);display:none;white-space:pre}
+</style>
+</head>
+<body>
+<canvas id="v"></canvas>
+<pre id="dbg"></pre>
+<script>
+"use strict";
+try {
+
+/* ---------------------------------------------------------------- palette */
+const C = {
+  void:[9,3,20], deep:[24,7,48], deep2:[45,12,86], brand:[153,63,245],
+  brandLo:[96,32,168], glow:[181,121,255], lilac:[217,194,255],
+  white:[254,255,254], ink:[1,2,2], pink:[232,85,195], cyan:[127,227,255],
+  gold:[255,198,77]
+};
+const rgb  = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+const rgba = (c,a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const mix  = (a,b,t) => [Math.round(a[0]+(b[0]-a[0])*t),Math.round(a[1]+(b[1]-a[1])*t),Math.round(a[2]+(b[2]-a[2])*t)];
+function hash(n){let x=Math.imul(n^0x9e3779b9,0x85ebca6b);x^=x>>>13;x=Math.imul(x,0xc2b2ae35);x^=x>>>16;return (x>>>0)/4294967296;}
+const rnd = (i,s) => hash((i*2654435761 + (s|0)*40503)|0);
+
+/* -------------------------------------------------------------- projection */
+const OX=960, OY=118;
+const PX = (wx,wy) => OX + (wx-wy)*32;
+const PY = (wx,wy,wz) => OY + (wx+wy)*16 - (wz||0)*32;
+
+/* ------------------------------------------------------------------- stage */
+const Q = new URLSearchParams(location.search);
+const FREEZE = Q.has('freeze');
+const TQ = parseFloat(Q.get('t'));
+const T0 = isFinite(TQ) ? TQ : 0;
+const DEBUG = Q.has('debug');
+const RM = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+const view = document.getElementById('v');
+view.width = Math.round(1920*DPR); view.height = Math.round(1080*DPR);
+const V = view.getContext('2d');
+
+function mk(w,h){
+  const c=document.createElement('canvas');
+  c.width=Math.max(1,Math.round(w*DPR)); c.height=Math.max(1,Math.round(h*DPR));
+  const x=c.getContext('2d'); x.setTransform(DPR,0,0,DPR,0,0);
+  c._lw=w; c._lh=h;
+  return [c,x];
+}
+const [bgC,bgX]     = mk(1920,1080);
+const [fxC,fxX]     = mk(1920,1080);
+const [flC,flX]     = mk(1920,1080);   // floor slab, alpha
+const [scC,scX]     = mk(1920,1080);   // per-band scratch
+const [foC,foX]     = mk(1920,1080);   // focus accumulator
+const [tmpC,tmpX]   = mk(1920,1080);   // block prerender workbench
+
+/* ------------------------------------------------------------ architecture */
+const MONO = {n:'mono', x0:13,x1:14,y0:3,y1:23,z0:0.5,h:5.6,mat:'mono'};
+const BLOCKS = [
+  {n:'plinth', x0:12,x1:16,y0:3,y1:23,z0:0,h:0.5,   mat:'plinth', walk:true},
+  MONO,
+  {n:'B1',  x0:3, x1:6,  y0:6, y1:9,  z0:0,h:2.00, mat:'stone'},
+  {n:'B2',  x0:6, x1:8,  y0:16,y1:20, z0:0,h:1.50, mat:'stone'},
+  {n:'B3',  x0:2, x1:5,  y0:18,y1:21, z0:0,h:0.75, mat:'planter'},
+  {n:'B4',  x0:3, x1:6,  y0:0, y1:3,  z0:0,h:1.00, mat:'stone'},
+  {n:'B5',  x0:18,x1:22, y0:6, y1:9,  z0:0,h:2.50, mat:'stone'},
+  {n:'B6',  x0:20,x1:23, y0:18,y1:21, z0:0,h:1.50, mat:'stone'},
+  {n:'B7',  x0:17,x1:20, y0:21,y1:24, z0:0,h:1.00, mat:'accent'},
+  {n:'B8',  x0:23,x1:25, y0:24,y1:26, z0:0,h:0.50, mat:'plinth', walk:true},
+  {n:'B9',  x0:15,x1:17, y0:3, y1:5,  z0:0,h:0.75, mat:'planter'},
+  {n:'B10', x0:9, x1:11, y0:22,y1:25, z0:0,h:1.25, mat:'stone'},
+];
+const BOLL = [[25,3],[25,9],[25,15],[25,20],[3,25],[9,25],[15,25],[20,25]];
+for (const [i,j] of BOLL) BLOCKS.push({n:'bo', x0:i,x1:i+1,y0:j,y1:j+1,z0:0,h:2.4,mat:'post',post:true});
+
+const MAT = {
+  stone:   {top:'#3c2262', left:'#2b1849', right:'#1c0f31'},
+  planter: {top:'#3f1d70', left:'#2d144e', right:'#1f0e36'},
+  accent:  {top:'#5a2a9c', left:'#3a1a67', right:'#26113f'},
+  plinth:  {top:'#35194f', left:'#25123c', right:'#190c29'},
+  mono:    {top:'#3a1a63', left:'#2c1547', right:'#241238'},
+  post:    {top:'#3a1c60', left:'#291344', right:'#1b0d2e'},
+};
+
+/* obstacle / walkable tile maps -------------------------------------------- */
+const TN = 26;
+const tileBlock = new Uint8Array(TN*TN);
+const tilePlat  = new Float32Array(TN*TN);
+for (const b of BLOCKS){
+  for (let i=b.x0;i<b.x1;i++) for (let j=b.y0;j<b.y1;j++){
+    if (b.walk) tilePlat[i*TN+j] = Math.max(tilePlat[i*TN+j], b.z0+b.h);
+    else tileBlock[i*TN+j] = 1;
+  }
+}
+for (let j=3;j<23;j++) tileBlock[14*TN+j] = 1;   // no ghost flush against the sign
+
+/* --------------------------------------------------- typography for the sign */
+const FAM_H = 'Outfit, "Segoe UI", system-ui, Arial, sans-serif';
+const FAM_M = '"JetBrains Mono", ui-monospace, Menlo, Consolas, monospace';
+function layoutT(x,str,size,weight,track,fam){
+  x.font = `${weight} ${size}px ${fam}`;
+  const tr = track*size; const chars=[]; let w=0;
+  for (const ch of str){ const cw = x.measureText(ch).width; chars.push([ch,w]); w += cw+tr; }
+  return {chars, w: Math.max(0, w-tr)};
+}
+function drawT(x,L,left,base,size,weight,fam){
+  x.font = `${weight} ${size}px ${fam}`;
+  for (let k=0;k<L.chars.length;k++) x.fillText(L.chars[k][0], left+L.chars[k][1], base);
+}
+
+/* ------------------------------------------------------------------- floor */
+function buildFloor(){
+  const g = flX;
+  g.clearRect(0,0,1920,1080);
+  // tiles
+  for (let i=0;i<26;i++) for (let j=0;j<26;j++){
+    const ring = (i===0||j===0||i===25||j===25);
+    g.fillStyle = ring ? '#2a1350' : (((i+j)&1) ? '#22103f' : '#1e0c3c');
+    g.beginPath();
+    g.moveTo(PX(i,j),PY(i,j)); g.lineTo(PX(i+1,j),PY(i+1,j));
+    g.lineTo(PX(i+1,j+1),PY(i+1,j+1)); g.lineTo(PX(i,j+1),PY(i,j+1));
+    g.closePath(); g.fill();
+  }
+  // grout
+  g.strokeStyle = rgba(C.brand,0.09); g.lineWidth = 1;
+  g.beginPath();
+  for (let i=0;i<=26;i++){ g.moveTo(PX(i,0),PY(i,0)); g.lineTo(PX(i,26),PY(i,26)); }
+  for (let j=0;j<=26;j++){ g.moveTo(PX(0,j),PY(0,j)); g.lineTo(PX(26,j),PY(26,j)); }
+  g.stroke();
+  // accent tiles
+  ACC.length = 0;
+  for (let i=0;i<26;i++) for (let j=0;j<26;j++){
+    const near = (i>=11&&i<=16&&j>=2&&j<=23) && (i===11||i===16||j===2||j===23);
+    const pick = rnd(i*26+j, 41) < 0.042;
+    if (!(near || pick)) continue;
+    if (tileBlock[i*TN+j] || tilePlat[i*TN+j]>0) continue;
+    ACC.push([i,j]);
+    g.beginPath();
+    g.moveTo(PX(i,j),PY(i,j)); g.lineTo(PX(i+1,j),PY(i+1,j));
+    g.lineTo(PX(i+1,j+1),PY(i+1,j+1)); g.lineTo(PX(i,j+1),PY(i,j+1));
+    g.closePath();
+    g.fillStyle = '#3d1774'; g.fill();
+    g.fillStyle = rgba(C.glow,0.16); g.fill();
+    g.strokeStyle = rgba(C.glow,0.5); g.lineWidth = 1.5; g.stroke();
+  }
+  // light pool
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  const lp = g.createRadialGradient(992,534,0,992,534,620);
+  lp.addColorStop(0, rgba(C.brand,0.20)); lp.addColorStop(1, rgba(C.brand,0));
+  g.fillStyle = lp;
+  g.beginPath();
+  g.moveTo(PX(0,0),PY(0,0)); g.lineTo(PX(26,0),PY(26,0));
+  g.lineTo(PX(26,26),PY(26,26)); g.lineTo(PX(0,26),PY(0,26));
+  g.closePath(); g.fill();
+  g.restore();
+
+  // baked cast shadows, clipped to the slab top
+  g.save();
+  g.beginPath();
+  g.moveTo(PX(0,0),PY(0,0)); g.lineTo(PX(26,0),PY(26,0));
+  g.lineTo(PX(26,26),PY(26,26)); g.lineTo(PX(0,26),PY(0,26));
+  g.closePath(); g.clip();
+  g.filter = 'blur(6px)';
+  g.fillStyle = 'rgba(6,2,14,0.55)';
+  for (const b of BLOCKS){
+    const zt = b.z0+b.h;
+    const dx = 0.9*zt*32, dy = 0.45*zt*32;
+    let x0=b.x0,x1=b.x1,y0=b.y0,y1=b.y1;
+    if (b.post){ x0+=0.32; x1-=0.32; y0+=0.32; y1-=0.32; }
+    g.beginPath();
+    g.moveTo(PX(x0,y0)+dx,PY(x0,y0)+dy); g.lineTo(PX(x1,y0)+dx,PY(x1,y0)+dy);
+    g.lineTo(PX(x1,y1)+dx,PY(x1,y1)+dy); g.lineTo(PX(x0,y1)+dx,PY(x0,y1)+dy);
+    g.closePath(); g.fill();
+  }
+  g.filter = 'none';
+  g.restore();
+
+  // slab side faces
+  const TH = 56;
+  g.fillStyle = '#170a2c';   // y = 26 wall (screen lower-left)
+  g.beginPath();
+  g.moveTo(PX(0,26),PY(0,26)); g.lineTo(PX(26,26),PY(26,26));
+  g.lineTo(PX(26,26),PY(26,26)+TH); g.lineTo(PX(0,26),PY(0,26)+TH);
+  g.closePath(); g.fill();
+  g.fillStyle = '#100619';   // x = 26 wall (screen lower-right)
+  g.beginPath();
+  g.moveTo(PX(26,0),PY(26,0)); g.lineTo(PX(26,26),PY(26,26));
+  g.lineTo(PX(26,26),PY(26,26)+TH); g.lineTo(PX(26,0),PY(26,0)+TH);
+  g.closePath(); g.fill();
+  g.lineWidth = 2; g.strokeStyle = rgba(C.brand,0.30);
+  g.beginPath();
+  g.moveTo(PX(0,26),PY(0,26)); g.lineTo(PX(26,26),PY(26,26)); g.lineTo(PX(26,0),PY(26,0));
+  g.stroke();
+  g.lineWidth = 1; g.strokeStyle = rgba(C.glow,0.18);
+  g.beginPath();
+  g.moveTo(PX(0,26),PY(0,26)+5); g.lineTo(PX(26,26),PY(26,26)+5); g.lineTo(PX(26,0),PY(26,0)+5);
+  g.stroke();
+}
+const ACC = [];
+
+/* ----------------------------------------------------- block face painting */
+function paintBlock(g,b){
+  const m = MAT[b.mat];
+  const zt = b.z0+b.h;
+  let x0=b.x0,x1=b.x1,y0=b.y0,y1=b.y1;
+  if (b.post){ x0+=0.32; x1-=0.32; y0+=0.32; y1-=0.32; }
+  const T = (x,y)=>[PX(x,y),PY(x,y,zt)];
+  const B = (x,y)=>[PX(x,y),PY(x,y,b.z0)];
+  const quad = (p,fill)=>{ g.beginPath(); g.moveTo(p[0][0],p[0][1]);
+    for(let k=1;k<4;k++) g.lineTo(p[k][0],p[k][1]); g.closePath();
+    g.fillStyle=fill; g.fill(); };
+
+  // right wall (x = x1) then left wall (y = y1), then top
+  quad([T(x1,y0),T(x1,y1),B(x1,y1),B(x1,y0)], m.right);
+  quad([T(x0,y1),T(x1,y1),B(x1,y1),B(x0,y1)], m.left);
+  quad([T(x0,y0),T(x1,y0),T(x1,y1),T(x0,y1)], m.top);
+
+  // top-face sheen
+  const a=T(x0,y0), c=T(x1,y1);
+  const sg = g.createLinearGradient(a[0],a[1],c[0],c[1]);
+  sg.addColorStop(0, rgba(C.glow,0.10)); sg.addColorStop(1, rgba(C.glow,0));
+  quad([T(x0,y0),T(x1,y0),T(x1,y1),T(x0,y1)], sg);
+
+  if (b.mat==='mono') paintSign(g,b);
+  else {
+    // rim light along the near-right top edges
+    const acc = (b.mat==='accent'||b.mat==='planter');
+    g.lineWidth = acc?2:1.4;
+    g.strokeStyle = rgba(C.glow, acc?0.55:0.26);
+    g.beginPath();
+    const p1=T(x1,y0),p2=T(x1,y1),p3=T(x0,y1);
+    g.moveTo(p1[0],p1[1]); g.lineTo(p2[0],p2[1]); g.lineTo(p3[0],p3[1]);
+    g.stroke();
+    if (b.post){
+      const cap=T((x0+x1)/2,(y0+y1)/2);
+      const gr=g.createRadialGradient(cap[0],cap[1],0,cap[0],cap[1],30);
+      gr.addColorStop(0,rgba(C.glow,0.55)); gr.addColorStop(0.3,rgba(C.brand,0.22));
+      gr.addColorStop(1,rgba(C.brand,0));
+      g.fillStyle=gr; g.fillRect(cap[0]-30,cap[1]-30,60,60);
+      g.fillStyle=rgb(C.glow);
+      g.beginPath(); g.arc(cap[0],cap[1],5,0,Math.PI*2); g.fill();
+    }
+  }
+}
+
+let SIGN_F = 96;
+function paintSign(g,b){
+  // the x = 14 wall, sheared into face-local space
+  g.save();
+  g.setTransform(DPR,0,0,DPR,0,0);
+  g.transform(1,-0.5,0,1,672,514.8);
+  const W=640, H=179.2;
+  g.fillStyle = '#241238'; g.fillRect(0,0,W,H);
+  const vg = g.createLinearGradient(0,0,0,H);
+  vg.addColorStop(0, rgba(C.brand,0.16)); vg.addColorStop(1, rgba(C.brand,0));
+  g.fillStyle = vg; g.fillRect(0,0,W,H);
+  g.lineWidth = 1.4; g.strokeStyle = rgba(C.brand,0.20);
+  g.strokeRect(18,16,604,147.2);
+
+  const LH = layoutT(g,'QUESTIONS?',SIGN_F,800,0.02,FAM_H);
+  const LL = layoutT(g,'Ask the hard ones.',30,500,0.10,FAM_M);
+  const hl = (W-LH.w)/2, ll = (W-LL.w)/2;
+
+  g.filter = 'blur(12px)';
+  g.fillStyle = rgba(C.brand,0.60);
+  drawT(g,LH,hl,100,SIGN_F,800,FAM_H); drawT(g,LH,hl,100,SIGN_F,800,FAM_H);
+  g.filter = 'blur(6px)';
+  g.fillStyle = rgba(C.brand,0.35);
+  drawT(g,LL,ll,134,30,500,FAM_M);
+  g.filter = 'none';
+
+  g.fillStyle = '#f6efff';
+  drawT(g,LH,hl,100,SIGN_F,800,FAM_H);
+  g.lineWidth = 1; g.strokeStyle = rgba(C.glow,0.90);
+  g.font = `800 ${SIGN_F}px ${FAM_H}`;
+  for (let k=0;k<LH.chars.length;k++) g.strokeText(LH.chars[k][0], hl+LH.chars[k][1], 100);
+  g.fillStyle = rgba(C.lilac,0.82);
+  drawT(g,LL,ll,134,30,500,FAM_M);
+  g.restore();
+  g.setTransform(DPR,0,0,DPR,0,0);
+
+  // top rim edge-light + bloom bleeding down the sign
+  const zt=b.z0+b.h;
+  g.lineWidth = 2; g.strokeStyle = rgba(C.glow,0.80);
+  g.beginPath();
+  g.moveTo(PX(14,3),PY(14,3,zt)); g.lineTo(PX(14,23),PY(14,23,zt));
+  g.stroke();
+  g.save();
+  g.globalCompositeOperation='lighter';
+  g.filter='blur(10px)';
+  g.lineWidth=6; g.strokeStyle=rgba(C.brand,0.28);
+  g.beginPath();
+  g.moveTo(PX(14,3),PY(14,3,zt)+6); g.lineTo(PX(14,23),PY(14,23,zt)+6);
+  g.stroke();
+  g.filter='none';
+  g.restore();
+  // near vertical corner
+  g.lineWidth = 2; g.strokeStyle = rgba(C.brand,0.55);
+  g.beginPath();
+  g.moveTo(PX(14,23),PY(14,23,zt)); g.lineTo(PX(14,23),PY(14,23,b.z0));
+  g.stroke();
+}
+
+function fitSign(){
+  const g = tmpX;
+  let F = 104;
+  while (F > 40 && layoutT(g,'QUESTIONS?',F,800,0.02,FAM_H).w > 588) F--;
+  SIGN_F = F;
+}
+
+/* ------------------------------------------------- column sprite extraction */
+const COLS = [];   // {key, x, y, w, h, img}
+function buildColumns(){
+  for (const b of BLOCKS){
+    tmpX.setTransform(DPR,0,0,DPR,0,0);
+    tmpX.clearRect(0,0,1920,1080);
+    paintBlock(tmpX,b);
+    const zt = b.z0+b.h;
+    for (let i=b.x0;i<b.x1;i++) for (let j=b.y0;j<b.y1;j++){
+      const ax = PX(i,j)-32-4;
+      const ay = PY(i,j,zt)-4;
+      const w = 72, h = 32 + b.h*32 + 8;
+      const [c,g] = mk(w,h);
+      const pts = [
+        [PX(i,j),   PY(i,j,zt)],       [PX(i+1,j), PY(i+1,j,zt)],
+        [PX(i+1,j), PY(i+1,j,b.z0)],   [PX(i+1,j+1),PY(i+1,j+1,b.z0)],
+        [PX(i,j+1), PY(i,j+1,b.z0)],   [PX(i,j+1), PY(i,j+1,zt)]
+      ];
+      let mx=0,my=0; for (const p of pts){mx+=p[0];my+=p[1];} mx/=6; my/=6;
+      g.translate(-ax,-ay);
+      g.beginPath();
+      for (let k=0;k<6;k++){
+        const dx=pts[k][0]-mx, dy=pts[k][1]-my, d=Math.hypot(dx,dy)||1;
+        const px=pts[k][0]+dx/d*0.6, py=pts[k][1]+dy/d*0.6;
+        if (k===0) g.moveTo(px,py); else g.lineTo(px,py);
+      }
+      g.closePath(); g.clip();
+      g.drawImage(tmpC,0,0,1920,1080);
+      COLS.push({key:i+j+1, x:ax, y:ay, w:w, h:h, img:c});
+    }
+  }
+  COLS.sort((a,b)=>a.key-b.key);
+}
+
+/* ------------------------------------------------------------- ghost sprite */
+const BODY = new Path2D('m195.9 107.8c-2.84-27.64-18.85-62.98-60.73-64.4h-3.09c-29.9 0-52.18 21.88-56.84 52.31-2.68 9.26-2.46 20.79-4.86 35.12-2.48 14.9-7.38 20.23-10.77 28.96-1.88 5.11-1.19 17.58 10.84 18.65 6.63 0.59 14.92-2.78 15.03-3.96-2.25 4.59-5.08 12.84-4.78 19.82 0.6 11.64 8.71 17.78 21.25 17.78 14.07 0 24.1-8.4 30.32-12.14 3.01 7.78 6.93 12.14 14.41 12.14 13.02 0 27.47-13.13 33.84-23.58 11.19-19.55 18.26-42.4 16.17-71.32-0.08-2.87-0.35-6.08-0.79-9.38z');
+const BX=57.2, BY=43.4, BW=139.5, GBH=168.7;
+const CXg=BX+BW/2, CYg=BY+GBH/2;
+const EL=135.5, ER=164.4, EY=104, ERX=8.4, ERY=13.6;
+
+const TINTS = [
+  C.white, C.lilac,
+  mix(C.white,C.brand,0.30), mix(C.white,C.pink,0.26),
+  mix(C.white,C.cyan,0.30),  mix(C.white,C.gold,0.28)
+];
+const TINT_CUT = [0.46,0.76,0.86,0.91,0.96,1.01];
+
+const NB = 20;
+const BKT = [];
+for (let k=0;k<NB;k++) BKT.push(12*Math.pow(1.0781,k));
+const GSPR = [];   // GSPR[bucket][tint*4 + flip*2 + blink]
+const SSPR = [];
+
+function buildGhosts(){
+  for (let k=0;k<NB;k++){
+    const h = BKT[k];
+    const pad = Math.ceil(h*0.35);
+    const w = Math.ceil(0.827*h) + pad*2;
+    const ch = Math.ceil(h) + pad*2;
+    const row = [];
+    for (let ti=0;ti<6;ti++) for (let fl=0;fl<2;fl++) for (let bl=0;bl<2;bl++){
+      if (bl && h < 22){ row[ti*4+fl*2+bl] = null; continue; }
+      const [c,g] = mk(w,ch);
+      const cx = w/2, cy = ch/2;
+      const tint = TINTS[ti];
+      const gr = g.createRadialGradient(cx,cy-h*0.04,0,cx,cy-h*0.04,h*0.62);
+      gr.addColorStop(0, rgba(C.glow,0.30));
+      gr.addColorStop(0.34, rgba(C.glow,0.15));
+      gr.addColorStop(1, rgba(C.glow,0));
+      g.fillStyle = gr; g.fillRect(cx-h,cy-h,h*2,h*2);
+      const s = h/GBH;
+      g.save();
+      g.translate(cx,cy); g.scale(fl?-s:s, s); g.translate(-CXg,-CYg);
+      const bg = g.createLinearGradient(0,BY,0,BY+GBH);
+      bg.addColorStop(0, rgb(tint));
+      bg.addColorStop(0.55, rgb(mix(tint,C.lilac,0.16)));
+      bg.addColorStop(1, rgb(mix(tint,C.brand,0.34)));
+      g.fillStyle = bg; g.fill(BODY);
+      g.lineWidth = 3.4; g.strokeStyle = rgba(C.white,0.5); g.stroke(BODY);
+      g.fillStyle = rgb(C.ink);
+      if (h < 16){
+        const t = 1.1/s;
+        g.globalAlpha = 0.55;
+        g.fillRect(EL-ERX, EY-t/2, (ER+ERX)-(EL-ERX), t);
+        g.globalAlpha = 1;
+      } else if (bl){
+        g.strokeStyle = rgb(C.ink); g.lineWidth = 4.4; g.lineCap='round';
+        g.beginPath(); g.moveTo(EL-ERX,EY); g.lineTo(EL+ERX,EY);
+        g.moveTo(ER-ERX,EY); g.lineTo(ER+ERX,EY); g.stroke();
+      } else {
+        g.beginPath(); g.ellipse(EL,EY,ERX,ERY,0,0,Math.PI*2); g.fill();
+        g.beginPath(); g.ellipse(ER,EY,ERX,ERY,0,0,Math.PI*2); g.fill();
+      }
+      g.restore();
+      row[ti*4+fl*2+bl] = c;
+    }
+    GSPR.push(row);
+
+    // ground shadow
+    const sw = Math.ceil(h*1.9)+6, sh = Math.ceil(h*1.0)+6;
+    const [sc,sg] = mk(sw,sh);
+    sg.save();
+    sg.translate(sw/2,sh/2); sg.rotate(0.4636);
+    sg.scale(h*0.62, h*0.24);
+    const rg = sg.createRadialGradient(0,0,0,0,0,1);
+    rg.addColorStop(0,'rgba(7,2,16,0.40)'); rg.addColorStop(0.55,'rgba(7,2,16,0.22)');
+    rg.addColorStop(1,'rgba(7,2,16,0)');
+    sg.fillStyle = rg; sg.beginPath(); sg.arc(0,0,1,0,Math.PI*2); sg.fill();
+    sg.restore();
+    SSPR.push(sc);
+  }
+}
+function bucketFor(h){
+  for (let k=0;k<NB;k++) if (BKT[k] >= h) return k;
+  return NB-1;
+}
+
+/* ----------------------------------------------------------- speech bubbles */
+const BUB = [];
+function buildBubbles(){
+  for (let k=0;k<3;k++){
+    const sc = [1,1.4,1.9][k];
+    const w = Math.ceil(22*sc)+6, h = Math.ceil(24*sc)+6;
+    const [c,g] = mk(w,h);
+    g.scale(sc,sc);
+    const bw=22, bh=17, r=6, x=3/sc, y=3/sc;
+    g.fillStyle = 'rgba(217,194,255,0.92)';
+    g.beginPath();
+    g.moveTo(x+r,y); g.arcTo(x+bw,y,x+bw,y+bh,r); g.arcTo(x+bw,y+bh,x,y+bh,r);
+    g.arcTo(x,y+bh,x,y,r); g.arcTo(x,y,x+bw,y,r); g.closePath(); g.fill();
+    g.beginPath();
+    g.moveTo(x+7,y+bh-1); g.lineTo(x+11,y+bh+5); g.lineTo(x+13,y+bh-1); g.closePath(); g.fill();
+    g.fillStyle = '#2d0c56';
+    g.font = `bold 12px ${FAM_H}`; g.textAlign='center'; g.textBaseline='middle';
+    g.fillText('?', x+bw/2, y+bh/2+0.5);
+    BUB.push(c);
+  }
+}
+
+/* ---------------------------------------------------------------- crowd sim */
+const SUB = 52;
+const blocked = new Uint8Array(SUB*SUB);
+const platz   = new Float32Array(SUB*SUB);
+for (let a=0;a<SUB;a++) for (let b=0;b<SUB;b++){
+  const ti=(a>>1)*TN + (b>>1);
+  blocked[a*SUB+b] = tileBlock[ti];
+  platz[a*SUB+b]   = tilePlat[ti];
+}
+const res = new Int16Array(SUB*SUB).fill(-1);
+
+const NG = Q.has('ng') ? (parseInt(Q.get('ng'),10)||0) : 340;
+const DIRS = [[1,0],[-1,0],[0,1],[0,-1]];
+const G = [];
+
+function freeAt(a,b){
+  return a>=0&&b>=0&&a<SUB&&b<SUB && !blocked[a*SUB+b];
+}
+function openAt(a,b){
+  return freeAt(a,b) && res[a*SUB+b] < 0;
+}
+function nrand(g){ const r = rnd((g.id*131 + g.rc*7919)|0, 17); g.rc++; return r; }
+
+/* The monolith is a 20-tile wall that nearly halves the plaza; ghosts keep to
+   their own side of it unless they deliberately set out for a crossing. */
+const inSpan = b => b >= 6 && b < 46;
+const sideOf = a => a < 26 ? 0 : 1;
+
+function pickTarget(g){
+  if (nrand(g) < (g.side ? 0.067 : 0.10)) g.side ^= 1;
+  for (let k=0;k<50;k++){
+    let a,b;
+    if (g.arch===0 && g.side===1){        // audience: around the plinth
+      const ang = nrand(g)*Math.PI*2, rad = 4 + nrand(g)*17;
+      a = Math.round(28 + Math.cos(ang)*rad);
+      b = Math.round(26 + Math.sin(ang)*rad);
+    } else if (g.arch===2){               // commuter: opposite rim
+      a = Math.round(52 - g.cx + (nrand(g)-0.5)*8);
+      b = Math.round(52 - g.cy + (nrand(g)-0.5)*8);
+    } else {                              // wanderer: uniform
+      a = (nrand(g)*SUB)|0; b = (nrand(g)*SUB)|0;
+    }
+    a = a<0?0:a>51?51:a; b = b<0?0:b>51?51:b;
+    if (inSpan(b) && sideOf(a) !== g.side) continue;
+    // the five tile-rows straight behind the wall are invisible; thin them out
+    if (a>=16 && a<26 && inSpan(b) && nrand(g) < 0.72) continue;
+    if (freeAt(a,b)){ g.tx=a; g.ty=b; return; }
+  }
+  g.tx=g.cx; g.ty=g.cy;
+}
+
+function runLen(a,b,d){
+  let n=0;
+  for (let k=1;k<=8;k++){
+    const na=a+DIRS[d][0]*k, nb=b+DIRS[d][1]*k;
+    if (!freeAt(na,nb) || res[na*SUB+nb]>=0) break;
+    n++;
+  }
+  return n;
+}
+
+function beginStep(g){
+  const dx = g.tx-g.cx, dy = g.ty-g.cy;
+  const cand = [];
+  if (Math.abs(dx) >= Math.abs(dy)){
+    if (dx) cand.push(dx>0?0:1);
+    if (dy) cand.push(dy>0?2:3);
+  } else {
+    if (dy) cand.push(dy>0?2:3);
+    if (dx) cand.push(dx>0?0:1);
+  }
+  // perpendicular fallbacks, ranked by free run
+  const perp = [];
+  for (let d=0;d<4;d++) if (cand.indexOf(d)<0) perp.push(d);
+  perp.sort((p,q)=>{
+    const r = runLen(g.cx,g.cy,q) - runLen(g.cx,g.cy,p);
+    return r !== 0 ? r : (rnd(g.id*17+q, g.sc) - rnd(g.id*17+p, g.sc));
+  });
+  const rev = g.dir^1;
+  const order = cand.concat(perp);
+  for (let pass=0; pass<2; pass++){
+    for (let k=0;k<order.length;k++){
+      const d = order[k];
+      if (pass===0 && d===rev && !g.desperate) continue;
+      const na=g.cx+DIRS[d][0], nb=g.cy+DIRS[d][1];
+      if (!openAt(na,nb)) continue;
+      res[na*SUB+nb] = g.id;
+      g.ax=g.cx; g.ay=g.cy; g.bx=na; g.by=nb;
+      g.dir=d; g.p=0; g.moving=1; g.sc++;
+      g.flip = !(d===0 || d===3);
+      return true;
+    }
+    if (!g.desperate) continue; else break;
+  }
+  return false;
+}
+
+function initCrowd(){
+  for (let id=0;id<NG;id++){
+    const g = {id, rc:1, sc:1};
+    const r7 = rnd(id,7);
+    g.arch = r7<0.25 ? 0 : (r7<0.76 ? 1 : 2);
+    g.spd  = 0.72 + rnd(id,10)*0.93;
+    g.idler = rnd(id,8) < 0.35;
+    g.pairy = rnd(id,9) < 0.12;
+    const rt = rnd(id,6); let ti=0;
+    while (ti<5 && rt > TINT_CUT[ti]) ti++;
+    g.tint = ti;
+    g.gk = 0.90 + 0.20*rnd(id,3);
+
+    g.side = rnd(id,30) < 0.40 ? 0 : 1;
+
+    let a=26,b=26;
+    for (let k=0;k<300;k++){
+      let ca,cb;
+      if (g.arch===0 && g.side===1){
+        const ang = nrand(g)*Math.PI*2, rad = nrand(g)*14;
+        ca = Math.round(28+Math.cos(ang)*rad); cb = Math.round(26+Math.sin(ang)*rad);
+      } else if (g.arch===2){
+        const sd = (nrand(g)*4)|0, u = (nrand(g)*52)|0, e = (nrand(g)*6)|0;
+        ca = sd===0?e : sd===1?51-e : u;
+        cb = sd===2?e : sd===3?51-e : u;
+      } else {
+        ca = (nrand(g)*SUB)|0; cb = (nrand(g)*SUB)|0;
+      }
+      if (ca<0||cb<0||ca>51||cb>51) continue;
+      if (inSpan(cb) && sideOf(ca) !== g.side) continue;
+      if (ca>=16 && ca<26 && inSpan(cb) && nrand(g) < 0.72) continue;
+      if (!openAt(ca,cb)) continue;
+      a=ca; b=cb; break;
+    }
+    if (!openAt(a,b)){
+      outer: for (let ca=0;ca<SUB;ca++) for (let cb=0;cb<SUB;cb++)
+        if (openAt(ca,cb)){ a=ca; b=cb; break outer; }
+    }
+    g.cx=a; g.cy=b; g.ax=a; g.ay=b; g.bx=a; g.by=b;
+    res[a*SUB+b] = id;
+    g.p=0; g.moving=0; g.dir=(nrand(g)*4)|0;
+    g.flip = !(g.dir===0||g.dir===3);
+    g.idle = nrand(g)*4;
+    g.stuck=0; g.desperate=0;
+    g.wz = platz[a*SUB+b];
+    pickTarget(g);
+    G.push(g);
+  }
+}
+
+const DT = 1/60;
+let steps = 0;
+
+function sim(){
+  const t = steps*DT;
+  for (let i=0;i<NG;i++){
+    const g = G[i];
+    if (g.moving){
+      g.p += DT * g.spd * 2;              // 0.5 tiles per step
+      if (g.p >= 1){
+        res[g.ax*SUB+g.ay] = -1;
+        g.cx=g.bx; g.cy=g.by; g.ax=g.bx; g.ay=g.by;
+        g.p=0; g.moving=0; g.stuck=0; g.desperate=0;
+        if (g.cx===g.tx && g.cy===g.ty){
+          g.idle = g.idler ? 2 + nrand(g)*7 : 0.2 + nrand(g)*1.2;
+          if (g.pairy){
+            for (let d=0;d<4;d++){
+              const na=g.cx+DIRS[d][0], nb=g.cy+DIRS[d][1];
+              if (na<0||nb<0||na>51||nb>51) continue;
+              const o = res[na*SUB+nb];
+              if (o>=0 && o!==g.id && !G[o].moving && G[o].idle>0.3){
+                g.idle = 4 + nrand(g)*6;
+                g.flip = !(d===0||d===3);
+                G[o].flip = !(((d^1)===0)||((d^1)===3));
+                break;
+              }
+            }
+          }
+          pickTarget(g);
+        }
+      }
+    } else if (g.idle > 0){
+      g.idle -= DT;
+    } else {
+      if (!beginStep(g)){
+        g.stuck += DT;
+        if (g.stuck > 1.2) g.desperate = 1;
+        if (g.stuck > 2.5){ pickTarget(g); g.stuck = 0; g.desperate = 0; }
+      }
+    }
+    const tz = platz[g.cx*SUB+g.cy];
+    g.wz += (tz - g.wz) * 0.14;
+  }
+  steps++;
+}
+
+/* ------------------------------------------------------------------- bands */
+const BANDV = [[0,9],[9,16],[16,38],[38,47],[47,53]];
+const BLUR  = [3.0,1.3,0,1.6,3.4];
+const bandCols = [[],[],[],[],[]];
+const bandClear = [];
+function bandOf(v){
+  if (v < 9) return 0;
+  if (v < 16) return 1;
+  if (v < 38) return 2;
+  if (v < 47) return 3;
+  return 4;
+}
+function buildBands(){
+  for (const c of COLS) bandCols[bandOf(c.key)].push(c);
+  for (let k=0;k<5;k++){
+    const y0 = 118 + BANDV[k][0]*16;
+    const y1 = (k===4) ? 1010 : 118 + BANDV[k][1]*16;
+    let top = y0 - 180, bot = y1 + 90;
+    for (const c of bandCols[k]) if (c.y < top) top = c.y;
+    bandClear.push([Math.max(0,top-16), Math.min(1080, bot+16)]);
+  }
+}
+
+/* ---------------------------------------------------------------- backdrop */
+function buildBg(){
+  const g = bgX;
+  const lg = g.createLinearGradient(0,0,0,1080);
+  lg.addColorStop(0,'#0b0418'); lg.addColorStop(0.481,'#150829'); lg.addColorStop(1,'#07020f');
+  g.fillStyle = lg; g.fillRect(0,0,1920,1080);
+  g.save(); g.globalCompositeOperation='lighter';
+  const q = (x,y,r,c,a)=>{
+    const rg=g.createRadialGradient(x,y,0,x,y,r);
+    rg.addColorStop(0,rgba(c,a)); rg.addColorStop(0.4,rgba(c,a*0.34));
+    rg.addColorStop(1,rgba(c,0));
+    g.fillStyle=rg; g.fillRect(x-r,y-r,r*2,r*2);
+  };
+  q(520,250,760,C.brand,0.22);
+  q(1480,760,700,C.pink,0.10);
+  g.save();
+  g.translate(960,980); g.scale(1,220/900);
+  const pg=g.createRadialGradient(0,0,0,0,0,900);
+  pg.addColorStop(0,rgba(C.brandLo,0.22)); pg.addColorStop(1,rgba(C.brandLo,0));
+  g.fillStyle=pg; g.fillRect(-900,-900,1800,1800);
+  g.restore();
+  g.restore();
+  for (let i=0;i<130;i++){
+    const x = rnd(i,21)*1920, y = rnd(i,22)*1080;
+    const r = 1 + rnd(i,23)*2;
+    const c = rnd(i,24) < 0.2 ? C.cyan : C.lilac;
+    g.fillStyle = rgba(c, 0.10 + rnd(i,25)*0.35);
+    g.beginPath(); g.arc(x,y,r,0,Math.PI*2); g.fill();
+  }
+}
+function buildFx(){
+  const g = fxX;
+  const rg = g.createRadialGradient(960,540,500,960,540,1180);
+  rg.addColorStop(0,'rgba(9,3,20,0)'); rg.addColorStop(1,'rgba(9,3,20,0.58)');
+  g.fillStyle = rg; g.fillRect(0,0,1920,1080);
+  const [nc,ng] = mk(256,256);
+  const im = ng.createImageData(Math.round(256*DPR),Math.round(256*DPR));
+  for (let i=0;i<im.data.length;i+=4){
+    const v = 110 + Math.floor(rnd(i,31)*90);
+    im.data[i]=v; im.data[i+1]=v; im.data[i+2]=v; im.data[i+3]=255;
+  }
+  ng.setTransform(1,0,0,1,0,0); ng.putImageData(im,0,0);
+  g.save(); g.globalAlpha = 0.030;
+  const pat = g.createPattern(nc,'repeat');
+  g.fillStyle = pat; g.setTransform(1,0,0,1,0,0);
+  g.fillRect(0,0,view.width,view.height);
+  g.restore(); g.setTransform(DPR,0,0,DPR,0,0);
+}
+let hazeGrad = null;
+
+/* -------------------------------------------------------------------- draw */
+const order = new Int32Array(NG);
+for (let i=0;i<NG;i++) order[i]=i;
+const gv = new Float32Array(NG);
+const bandG = [[],[],[],[],[]];
+let lastBlits = 0;
+
+function draw(){
+  const t = steps*DT;
+  let blits = 0;
+
+  for (let i=0;i<NG;i++){
+    const g=G[i];
+    const sp = g.moving ? g.p*g.p*(3-2*g.p) : 0;
+    g.wx = (g.ax + (g.bx-g.ax)*sp)*0.5 + 0.25;
+    g.wy = (g.ay + (g.by-g.ay)*sp)*0.5 + 0.25;
+    gv[i] = g.wx + g.wy;
+  }
+  for (let i=1;i<NG;i++){
+    const v = order[i], key = gv[v];
+    let j=i-1;
+    while (j>=0 && gv[order[j]] > key){ order[j+1]=order[j]; j--; }
+    order[j+1]=v;
+  }
+  for (let k=0;k<5;k++) bandG[k].length = 0;
+  for (let i=0;i<NG;i++){ const id=order[i]; bandG[bandOf(gv[id])].push(id); }
+
+  foX.setTransform(1,0,0,1,0,0);
+  foX.clearRect(0,0,foC.width,foC.height);
+
+  let prevTop = 0, prevBot = 0;
+  for (let k=0;k<5;k++){
+    const g = scX;
+    g.setTransform(DPR,0,0,DPR,0,0);
+    const ct = Math.min(prevTop, bandClear[k][0]), cb = Math.max(prevBot, bandClear[k][1]);
+    g.clearRect(0, ct, 1920, cb-ct);
+    prevTop = bandClear[k][0]; prevBot = bandClear[k][1];
+
+    // floor strip
+    const y0 = 118 + BANDV[k][0]*16;
+    const y1 = (k===4) ? 1010 : 118 + BANDV[k][1]*16;
+    g.drawImage(flC, 0, y0*DPR, flC.width, (y1-y0)*DPR, 0, y0, 1920, y1-y0);
+
+    // accent shimmer inside the focal band
+    if (k===2){
+      for (let n=0;n<ACC.length;n++){
+        const i=ACC[n][0], j=ACC[n][1];
+        if (bandOf(i+j+1) !== 2) continue;
+        const a = 0.10 + 0.10*Math.sin(t*0.7 + n*1.7);
+        g.fillStyle = rgba(C.glow, a);
+        g.beginPath();
+        g.moveTo(PX(i,j),PY(i,j)); g.lineTo(PX(i+1,j),PY(i+1,j));
+        g.lineTo(PX(i+1,j+1),PY(i+1,j+1)); g.lineTo(PX(i,j+1),PY(i,j+1));
+        g.closePath(); g.fill();
+      }
+    }
+
+    const cols = bandCols[k], gs = bandG[k];
+    let ci=0, gi=0;
+    while (ci < cols.length || gi < gs.length){
+      const ck = ci < cols.length ? cols[ci].key : 1e9;
+      const gk = gi < gs.length ? gv[gs[gi]] : 1e9;
+      if (ck <= gk){
+        const c = cols[ci++];
+        g.drawImage(c.img, c.x, c.y, c.w, c.h); blits++;
+      } else {
+        const id = gs[gi++]; const gh = G[id];
+        blits += drawGhost(g, gh, t);
+      }
+    }
+
+    foX.setTransform(1,0,0,1,0,0);
+    foX.filter = BLUR[k] ? `blur(${BLUR[k]*DPR}px)` : 'none';
+    foX.drawImage(scC, 0, 0);
+  }
+  foX.filter = 'none';
+
+  V.setTransform(1,0,0,1,0,0);
+  V.clearRect(0,0,view.width,view.height);
+  V.drawImage(bgC,0,0);
+  V.filter = 'saturate(1.14) contrast(1.05)';
+  V.drawImage(foC,0,0);
+  V.filter = 'none';
+  V.setTransform(DPR,0,0,DPR,0,0);
+  V.save();
+  V.globalCompositeOperation = 'lighter';
+  if (!hazeGrad){
+    hazeGrad = V.createLinearGradient(0,118,0,470);
+    hazeGrad.addColorStop(0,'rgba(45,12,86,0.60)');
+    hazeGrad.addColorStop(1,'rgba(45,12,86,0)');
+  }
+  V.fillStyle = hazeGrad; V.fillRect(0,118,1920,352);
+  V.restore();
+  V.setTransform(1,0,0,1,0,0);
+  V.drawImage(fxC,0,0);
+  V.setTransform(DPR,0,0,DPR,0,0);
+  lastBlits = blits;
+}
+
+function drawGhost(g, gh, t){
+  const v = gh.wx + gh.wy;
+  const size = (15 + 30*(v/52)) * gh.gk;
+  const sx = PX(gh.wx, gh.wy);
+  const sy = PY(gh.wx, gh.wy, gh.wz);
+  let n = 0;
+
+  if (size >= 18){
+    const b = bucketFor(size);
+    const s = SSPR[b], f = size/BKT[b];
+    const w = s._lw*f, h = s._lh*f;
+    g.drawImage(s, sx + 0.30*size - w/2, sy + 0.15*size - h/2, w, h); n++;
+  }
+
+  let cy = sy - size*0.52;
+  if (gh.moving) cy -= Math.sin(gh.p*Math.PI)*0.075*size;
+  else cy -= Math.sin(t*1.6 + rnd(gh.id,5)*6.283)*0.03*size;
+
+  const b = bucketFor(size);
+  const bp = (t*0.27 + rnd(gh.id,11)) % 1;
+  const blink = (size >= 22 && bp < 0.035) ? 1 : 0;
+  const spr = GSPR[b][gh.tint*4 + (gh.flip?1:0)*2 + blink] || GSPR[b][gh.tint*4 + (gh.flip?1:0)*2];
+  const f = size/BKT[b];
+  const sq = gh.moving ? 1 + Math.sin(gh.p*6.2832)*0.05 : 1;
+  const w = spr._lw*f, h = spr._lh*f*sq;
+  g.drawImage(spr, sx - w/2, cy - h/2, w, h); n++;
+
+  if (size >= 22){
+    const ep = Math.floor(t/6);
+    if (rnd(gh.id*31 + ep, 12) < 0.018){
+      const st = ep*6 + rnd(gh.id,13)*2.4;
+      if (t >= st && t < st+3.2){
+        const k = size < 28 ? 0 : size < 36 ? 1 : 2;
+        const bc = BUB[k];
+        const bf = size/30;
+        const bw = bc._lw*bf, bh2 = bc._lh*bf;
+        g.drawImage(bc, sx + size*0.30, cy - size*0.55 - bh2, bw, bh2); n++;
+      }
+    }
+  }
+  return n;
+}
+
+/* -------------------------------------------------------------------- boot */
+fitSign();
+buildFloor();
+buildColumns();
+buildGhosts();
+buildBubbles();
+buildBg();
+buildFx();
+buildBands();
+initCrowd();
+
+const dbg = document.getElementById('dbg');
+if (DEBUG) dbg.style.display='block';
+let fps = 0, lastT = 0, msJS = 0;
+
+if (FREEZE || RM){
+  const target = Math.round((RM && !FREEZE ? 22 : T0) * 60);
+  while (steps < target) sim();
+  draw();
+  if (DEBUG) dbg.textContent = `frozen t=${(steps/60).toFixed(2)} steps=${steps}\nghosts=${NG} cols=${COLS.length} blits=${lastBlits}\nsignF=${SIGN_F}`;
+} else {
+  let prev = performance.now(), acc = 0;
+  const loop = (now) => {
+    let el = (now - prev)/1000; prev = now;
+    if (el > 0.25) el = 0.25;
+    acc += el;
+    let n = 0;
+    while (acc >= DT && n < 5){ sim(); acc -= DT; n++; }
+    const t0 = performance.now();
+    draw();
+    msJS = msJS*0.9 + (performance.now()-t0)*0.1;
+    fps = fps*0.9 + (1/Math.max(el,0.001))*0.1;
+    if (DEBUG) dbg.textContent =
+      `fps ${fps.toFixed(1)}  js ${msJS.toFixed(2)}ms\nsteps ${steps}  t ${(steps/60).toFixed(1)}\n` +
+      `ghosts ${NG}  bands ${bandG.map(b=>b.length).join('/')}\ncols ${COLS.length}  blits ${lastBlits}  signF ${SIGN_F}`;
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+
+} catch (err) {
+  const c = document.getElementById('v');
+  c.width = 1920; c.height = 1080;
+  const g = c.getContext('2d');
+  g.fillStyle = '#090314'; g.fillRect(0,0,1920,1080);
+  g.fillStyle = '#d9c2ff'; g.font = '22px monospace';
+  const msg = (err && (err.stack || err.message)) ? String(err.stack || err.message) : String(err);
+  msg.split('\n').slice(0,14).forEach((l,i)=> g.fillText(l.slice(0,120), 40, 80 + i*30));
+}
+</script>
+</body>
+</html>

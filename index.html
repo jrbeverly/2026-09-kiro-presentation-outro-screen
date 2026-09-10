@@ -1,0 +1,1048 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kiro Outro — Paper Civilisation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;900&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #090314; overflow: hidden; }
+  body { display: flex; }
+  .stage {
+    position: relative;
+    width: min(100vw, calc(100vh * 16 / 9));
+    height: min(100vh, calc(100vw * 9 / 16));
+    margin: auto;
+    filter: saturate(1.08) contrast(1.03);
+  }
+  #main { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #err {
+    position: absolute; left: 2%; top: 2%; width: 96%;
+    font: 15px/1.5 ui-monospace, monospace; color: #ff8ab0; white-space: pre-wrap;
+    text-shadow: 0 0 8px #000; z-index: 9;
+  }
+</style>
+</head>
+<body>
+<div class="stage"><canvas id="main"></canvas><div id="err"></div></div>
+<script>
+window.onerror = function (m, s, l) {
+  document.getElementById('err').textContent = 'JS ERROR: ' + m + ' @' + l;
+};
+(function () {
+'use strict';
+
+var W = 1920, H = 1080;
+var Q = new URLSearchParams(location.search);
+var REDUCED = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+var FREEZE = Q.has('freeze') || REDUCED;
+var T0 = Q.has('t') ? parseFloat(Q.get('t')) : (REDUCED ? 26 : 0);
+if (!isFinite(T0) || T0 < 0) T0 = 0;
+var DEBUG = Q.has('debug');
+
+// Backing store is the authored 1920x1080. Seven full-frame canvases at dpr
+// 1.5 wedges headless Chromium's --screenshot (the 4+ painted-canvas wall in
+// this container); the deck plays at 1080p so 1:1 is exact anyway. Raise this
+// to `Math.min(window.devicePixelRatio || 1, 2)` for a retina-crisp build.
+var dpr = 1;
+var BS = dpr * 0.55;
+
+var C_void = [9, 3, 20], C_deep2 = [45, 12, 86], C_brand = [153, 63, 245];
+var C_brandLo = [96, 32, 168], C_glow = [181, 121, 255], C_lilac = [217, 194, 255];
+var C_white = [254, 255, 254], C_pink = [232, 85, 195], C_cyan = [127, 227, 255];
+var C_gold = [255, 198, 77];
+
+function rgb(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function mix(a, b, t) {
+  return [Math.round(a[0] + (b[0] - a[0]) * t), Math.round(a[1] + (b[1] - a[1]) * t), Math.round(a[2] + (b[2] - a[2]) * t)];
+}
+function clamp(v, a, b) { a = a === undefined ? 0 : a; b = b === undefined ? 1 : b; return v < a ? a : v > b ? b : v; }
+
+function hash(n) {
+  var x = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b);
+  x ^= x >>> 13; x = Math.imul(x, 0xc2b2ae35); x ^= x >>> 16;
+  return (x >>> 0) / 4294967296;
+}
+function rnd(i, s) { return hash((i * 2654435761 + (s || 0) * 40503) | 0); }
+function rndr(i, s, a, b) { return a + rnd(i, s) * (b - a); }
+
+// ---------------------------------------------------------------- projection
+// Ground plane only; vanishing line off-frame at y = -420.
+//   sy = -420 + 1900/Z      h = 81.4/Z = 0.04284*(sy+420)
+// h runs 18px at the top of frame to 64px at the bottom: a 3.6:1 ramp that
+// keeps the far crowd above the ~16px Kiro legibility floor.
+var FOC = 1900, YH = -420, HG = 81.4;
+var ZMIN = 1.20, ZMAX = 5.30;
+function syOf(Z) { return YH + FOC / Z; }
+function zOf(sy) { return FOC / (sy - YH); }
+function sxOf(X, Z) { return 960 + FOC * X / Z; }
+function hOf(Z) { return HG / Z; }
+function Xv(Z) { return 960 * Z / FOC; }
+function toWorld(sx, sy) { var Z = zOf(sy); return [(sx - 960) * Z / FOC, Z]; }
+
+var BODY = new Path2D('m195.9 107.8c-2.84-27.64-18.85-62.98-60.73-64.4h-3.09c-29.9 0-52.18 21.88-56.84 52.31-2.68 9.26-2.46 20.79-4.86 35.12-2.48 14.9-7.38 20.23-10.77 28.96-1.88 5.11-1.19 17.58 10.84 18.65 6.63 0.59 14.92-2.78 15.03-3.96-2.25 4.59-5.08 12.84-4.78 19.82 0.6 11.64 8.71 17.78 21.25 17.78 14.07 0 24.1-8.4 30.32-12.14 3.01 7.78 6.93 12.14 14.41 12.14 13.02 0 27.47-13.13 33.84-23.58 11.19-19.55 18.26-42.4 16.17-71.32-0.08-2.87-0.35-6.08-0.79-9.38z');
+var BX = 57.2, BY = 43.4, BW = 139.5, BH = 168.7;
+var CX = BX + BW / 2;
+var EL = 135.5, ER = 164.4, EY = 104, ERX = 8.4, ERY = 13.6;
+
+// ---------------------------------------------------------------- canvases
+var main = document.getElementById('main');
+main.width = Math.round(W * dpr); main.height = Math.round(H * dpr);
+var X0 = main.getContext('2d');
+
+function mk(scale) {
+  var c = document.createElement('canvas');
+  c.width = Math.round(W * scale); c.height = Math.round(H * scale);
+  var g = c.getContext('2d');
+  g.setTransform(scale, 0, 0, scale, 0, 0);
+  return g;
+}
+var GROUND = mk(dpr), GRADE = mk(dpr), MID = mk(dpr);
+var SHADOW = mk(BS), FAR = mk(BS), NEAR = mk(BS), SCRATCH = mk(BS);
+
+// ---------------------------------------------------------------- atlas
+var BUCKETS = [10, 12, 14, 17, 20, 24, 29, 35, 42, 50, 60, 72];
+var NB = BUCKETS.length;
+var TINTS = [
+  C_white,
+  C_lilac,
+  mix(C_white, C_brand, 0.28),
+  mix(C_white, C_pink, 0.24),
+  mix(C_white, C_cyan, 0.28),
+  mix(C_white, C_gold, 0.26)
+];
+var TINT_CUM = [0.62, 0.78, 0.87, 0.92, 0.97, 1.0];
+
+function spriteGeom(h) {
+  var sw = Math.ceil(1.30 * h), sh = Math.ceil(1.40 * h);
+  var ax = sw / 2, ay = sh - Math.round(0.05 * h);
+  return { sw: sw, sh: sh, ax: ax, ay: ay, by: ay - 0.10 * h };
+}
+
+function bakeGhost(h, tint, flip, blink) {
+  var G = spriteGeom(h);
+  var c = document.createElement('canvas');
+  c.width = G.sw; c.height = G.sh;
+  var g = c.getContext('2d');
+  var s = h / BH;
+
+  if (h >= 26) {
+    var cxx = G.ax, cyy = G.by - h * 0.5, rr = h * 0.60;
+    var gg = g.createRadialGradient(cxx, cyy, h * 0.22, cxx, cyy, rr);
+    gg.addColorStop(0, rgba(C_glow, 0.10));
+    gg.addColorStop(1, rgba(C_glow, 0));
+    g.fillStyle = gg;
+    g.fillRect(0, 0, G.sw, G.sh);
+  }
+
+  g.save();
+  g.translate(G.ax, G.by);
+  g.scale(flip ? -s : s, s);
+  g.translate(-CX, -(BY + BH));
+
+  var lg = g.createLinearGradient(0, BY, 0, BY + BH);
+  lg.addColorStop(0, rgb(tint));
+  lg.addColorStop(0.55, rgb(mix(tint, C_lilac, 0.16)));
+  lg.addColorStop(1, rgb(mix(tint, C_brand, 0.34)));
+  g.fillStyle = lg;
+  g.fill(BODY);
+
+  if (h >= 14) {
+    g.lineWidth = Math.max(0.7 / s, 3.4);
+    g.strokeStyle = rgba(C_white, 0.5);
+    g.stroke(BODY);
+  }
+
+  g.fillStyle = '#010202';
+  if (h >= 15) {
+    if (blink) {
+      g.strokeStyle = '#010202'; g.lineWidth = 4.4; g.lineCap = 'round';
+      g.beginPath(); g.moveTo(EL - ERX, EY); g.lineTo(EL + ERX, EY); g.stroke();
+      g.beginPath(); g.moveTo(ER - ERX, EY); g.lineTo(ER + ERX, EY); g.stroke();
+    } else {
+      g.beginPath(); g.ellipse(EL, EY, ERX, ERY, 0, 0, 6.2832); g.fill();
+      g.beginPath(); g.ellipse(ER, EY, ERX, ERY, 0, 0, 6.2832); g.fill();
+    }
+  } else {
+    g.beginPath(); g.ellipse((EL + ER) / 2, EY, 15, 12, 0, 0, 6.2832); g.fill();
+  }
+  g.restore();
+  return c;
+}
+
+function bakeSil(h, fade) {
+  var G = spriteGeom(h);
+  var c = document.createElement('canvas');
+  c.width = G.sw; c.height = G.sh;
+  var g = c.getContext('2d');
+  var s = h / BH;
+  g.save();
+  g.translate(G.ax, G.by);
+  g.scale(s, s);
+  g.translate(-CX, -(BY + BH));
+  g.fillStyle = 'rgb(3,0,9)';
+  g.fill(BODY);
+  g.restore();
+  if (fade) {
+    g.globalCompositeOperation = 'destination-in';
+    var lg = g.createLinearGradient(0, G.ay, 0, G.ay - h * 0.55);
+    lg.addColorStop(0, 'rgba(0,0,0,1)');
+    lg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = lg;
+    g.fillRect(0, 0, G.sw, G.sh);
+    g.globalCompositeOperation = 'source-over';
+  }
+  return c;
+}
+
+var GEOM = [], SPR = [], SPRB = [], SIL = [], FADE = [];
+for (var b = 0; b < NB; b++) {
+  var hb = BUCKETS[b];
+  GEOM.push(spriteGeom(hb));
+  var row = [], rowb = [];
+  for (var ti = 0; ti < 6; ti++) {
+    row.push([bakeGhost(hb, TINTS[ti], false, false), bakeGhost(hb, TINTS[ti], true, false)]);
+    rowb.push(hb >= 35 ? [bakeGhost(hb, TINTS[ti], false, true), bakeGhost(hb, TINTS[ti], true, true)] : null);
+  }
+  SPR.push(row); SPRB.push(rowb);
+  SIL.push(bakeSil(hb, false));
+  FADE.push(bakeSil(hb, true));
+}
+function bucketOf(h) {
+  for (var i = 0; i < NB; i++) if (BUCKETS[i] >= h) return i;
+  return NB - 1;
+}
+
+var BLOB = (function () {
+  var c = document.createElement('canvas'); c.width = 64; c.height = 64;
+  var g = c.getContext('2d');
+  var gg = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gg.addColorStop(0, 'rgba(3,0,10,0.9)');
+  gg.addColorStop(0.42, 'rgba(3,0,10,0.58)');
+  gg.addColorStop(1, 'rgba(3,0,10,0)');
+  g.fillStyle = gg; g.fillRect(0, 0, 64, 64);
+  return c;
+})();
+
+// ---------------------------------------------------------------- type
+var FSANS = "Outfit, 'Segoe UI', system-ui, Arial, sans-serif";
+var FMONO = "'JetBrains Mono', ui-monospace, 'DejaVu Sans Mono', monospace";
+var TW = 1440, TH = 470;
+var TAX = 720, TAY = 470;              // local (720,470) == stage (960,700)
+var TXO = 960 - TAX, TYO = 700 - TAY;
+var HEAD = "SO THAT'S KIRO";
+var HEAD_BASE = 352, RULE_Y = 402;
+
+function layoutCaps(g, text, size, weight, track) {
+  g.font = weight + ' ' + size + 'px ' + FSANS;
+  var adv = [], w = 0;
+  for (var i = 0; i < text.length; i++) {
+    var a = g.measureText(text[i]).width + track * size;
+    adv.push(a); w += a;
+  }
+  return { adv: adv, w: w - track * size };
+}
+function runCaps(g, text, lay, size, weight, cx, y, stroke) {
+  g.font = weight + ' ' + size + 'px ' + FSANS;
+  var cur = cx - lay.w / 2;
+  for (var i = 0; i < text.length; i++) {
+    if (stroke) g.strokeText(text[i], cur, y); else g.fillText(text[i], cur, y);
+    cur += lay.adv[i];
+  }
+}
+function mkText(scale) {
+  var c = document.createElement('canvas');
+  c.width = Math.round(TW * scale); c.height = Math.round(TH * scale);
+  var g = c.getContext('2d');
+  g.setTransform(scale, 0, 0, scale, 0, 0);
+  return g;
+}
+var TEXT = mkText(dpr), TEXTSIL = mkText(BS), TEXTFADE = mkText(dpr);
+
+var hSize, hLay, HEAD_TOP;
+function measureType() {
+  hSize = 168;
+  hLay = layoutCaps(TEXT, HEAD, hSize, '900', 0.03);
+  if (hLay.w > 1104) { hSize = Math.floor(hSize * 1104 / hLay.w); hLay = layoutCaps(TEXT, HEAD, hSize, '900', 0.03); }
+  HEAD_TOP = HEAD_BASE - hSize * 0.74;
+}
+
+function paintText(g, sil) {
+  g.textBaseline = 'alphabetic';
+  g.textAlign = 'left';
+  g.lineJoin = 'round';
+  if (sil) {
+    g.fillStyle = 'rgb(3,0,9)';
+    runCaps(g, HEAD, hLay, hSize, '900', TAX, HEAD_BASE, false);
+    return;
+  }
+  g.lineWidth = 11;
+  g.strokeStyle = 'rgba(9,3,20,0.80)';
+  runCaps(g, HEAD, hLay, hSize, '900', TAX, HEAD_BASE, true);
+  g.save();
+  g.shadowColor = 'rgba(153,63,245,0.55)';
+  g.shadowBlur = 60; g.shadowOffsetY = 10;
+  g.fillStyle = 'rgb(254,255,254)';
+  runCaps(g, HEAD, hLay, hSize, '900', TAX, HEAD_BASE, false);
+  g.restore();
+
+  var rg = g.createLinearGradient(TAX - 150, 0, TAX + 150, 0);
+  rg.addColorStop(0, 'rgba(153,63,245,0)');
+  rg.addColorStop(0.5, 'rgb(153,63,245)');
+  rg.addColorStop(1, 'rgba(153,63,245,0)');
+  g.fillStyle = rg;
+  g.fillRect(TAX - 150, RULE_Y, 300, 4);
+}
+
+function buildText() {
+  measureType();
+  TEXT.clearRect(0, 0, TW, TH);
+  TEXTSIL.clearRect(0, 0, TW, TH);
+  TEXTFADE.clearRect(0, 0, TW, TH);
+  paintText(TEXT, false);
+  paintText(TEXTSIL, true);
+  paintText(TEXTFADE, true);
+  TEXTFADE.globalCompositeOperation = 'destination-in';
+  var lg = TEXTFADE.createLinearGradient(0, TAY, 0, TAY - (TAY - HEAD_BASE) - 30);
+  lg.addColorStop(0, 'rgba(0,0,0,1)');
+  lg.addColorStop(1, 'rgba(0,0,0,0)');
+  TEXTFADE.fillStyle = lg;
+  TEXTFADE.fillRect(0, 0, TW, TH);
+  TEXTFADE.globalCompositeOperation = 'source-over';
+}
+buildText();
+
+// ---------------------------------------------------------------- keep-out
+var KCX = 960, KCY = 598, KA = 606, KB = 202, KN = 2.6;
+function qOf(sx, sy) {
+  var nx = Math.abs((sx - KCX) / KA), ny = Math.abs((sy - KCY) / KB);
+  return Math.pow(nx, KN) + Math.pow(ny, KN);
+}
+function superPt(th, rho) {
+  var c = Math.cos(th), s = Math.sin(th);
+  var x = KA * Math.sign(c) * Math.pow(Math.abs(c), 2 / KN);
+  var y = KB * Math.sign(s) * Math.pow(Math.abs(s), 2 / KN);
+  return [KCX + x * rho, KCY - y * rho];
+}
+function superPath(g, rho) {
+  g.beginPath();
+  for (var i = 0; i <= 200; i++) {
+    var p = superPt(i / 200 * 6.2832, rho);
+    if (i === 0) g.moveTo(p[0], p[1]); else g.lineTo(p[0], p[1]);
+  }
+  g.closePath();
+}
+
+// ---------------------------------------------------------------- ground
+function groundOval(g, X, Z, R, paint) {
+  var sx = sxOf(X, Z), sy = syOf(Z);
+  var rx = FOC * R / Z, ry = Math.max(0.55, rx / Z);
+  g.save();
+  g.translate(sx, sy);
+  g.scale(1, ry / rx);
+  paint(g, rx);
+  g.restore();
+}
+function radialFill(g, rx, stops) {
+  var rad = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  for (var i = 0; i < stops.length; i++) rad.addColorStop(stops[i][0], stops[i][1]);
+  g.fillStyle = rad;
+  g.beginPath(); g.arc(0, 0, rx, 0, 6.2832); g.fill();
+}
+
+function buildGround() {
+  var g = GROUND, j;
+  var bg = g.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0.00, 'rgb(23,9,46)');
+  bg.addColorStop(0.24, 'rgb(30,12,60)');
+  bg.addColorStop(0.50, 'rgb(36,15,71)');
+  bg.addColorStop(0.74, 'rgb(28,11,56)');
+  bg.addColorStop(0.90, 'rgb(18,7,38)');
+  bg.addColorStop(1.00, 'rgb(11,3,24)');
+  g.fillStyle = bg;
+  g.fillRect(0, 0, W, H);
+
+  g.globalCompositeOperation = 'lighter';
+  for (j = 0; j < 42; j++) {
+    var Zj = ZMIN + Math.pow(rnd(j, 101), 1.5) * (ZMAX - ZMIN);
+    var Xj = rndr(j, 102, -1, 1) * Xv(Zj) * 1.2;
+    var Rj = 0.22 + rnd(j, 103) * 0.80;
+    var col = mix(C_deep2, C_brand, rnd(j, 104) * 0.60);
+    var a = 0.050 + rnd(j, 105) * 0.090;
+    (function (col, a) {
+      groundOval(g, Xj, Zj, Rj, function (gg, rx) {
+        radialFill(gg, rx, [[0, rgba(col, a)], [0.45, rgba(col, a * 0.42)], [1, rgba(col, 0)]]);
+      });
+    })(col, a);
+  }
+  g.globalCompositeOperation = 'source-over';
+
+  for (j = 0; j < 26; j++) {
+    var Zd = ZMIN + Math.pow(rnd(j, 111), 1.4) * (ZMAX - ZMIN);
+    var Xd = rndr(j, 112, -1, 1) * Xv(Zd) * 1.2;
+    var Rd = 0.18 + rnd(j, 113) * 0.72;
+    var ad = 0.14 + rnd(j, 114) * 0.20;
+    (function (ad) {
+      groundOval(g, Xd, Zd, Rd, function (gg, rx) {
+        radialFill(gg, rx, [[0, 'rgba(4,1,11,' + ad + ')'], [0.5, 'rgba(4,1,11,' + (ad * 0.5) + ')'], [1, 'rgba(4,1,11,0)']]);
+      });
+    })(ad);
+  }
+
+  for (j = 0; j < 1500; j++) {
+    var gy = rnd(j, 201) * 1080;
+    var Zs = zOf(gy);
+    var Xs = rndr(j, 202, -1.05, 1.05) * Xv(Zs);
+    var Rs = 0.0022 + rnd(j, 203) * 0.0062;
+    var sx = sxOf(Xs, Zs);
+    var rx = FOC * Rs / Zs, ry = Math.max(0.5, rx / Zs);
+    g.fillStyle = rgba(C_glow, 0.08 + rnd(j, 204) * 0.15);
+    g.beginPath(); g.ellipse(sx, gy, Math.max(0.5, rx), ry, 0, 0, 6.2832); g.fill();
+  }
+
+  // the plaza the words stand in — a ground circle, so it foreshortens like
+  // everything else on the plane
+  var PZ = zOf(KCY);
+  g.globalCompositeOperation = 'lighter';
+  groundOval(g, 0, PZ, 0.54, function (gg, rx) {
+    radialFill(gg, rx, [
+      [0, 'rgba(153,63,245,0.17)'],
+      [0.42, 'rgba(153,63,245,0.09)'],
+      [0.74, 'rgba(96,32,168,0.03)'],
+      [1, 'rgba(153,63,245,0)']
+    ]);
+  });
+  g.globalCompositeOperation = 'source-over';
+}
+buildGround();
+
+function buildGrade() {
+  var g = GRADE;
+  g.globalCompositeOperation = 'lighter';
+  var h1 = g.createLinearGradient(0, 330, 0, -40);
+  h1.addColorStop(0, 'rgba(45,12,86,0)');
+  h1.addColorStop(1, 'rgba(45,12,86,0.34)');
+  g.fillStyle = h1; g.fillRect(0, -40, W, 380);
+  var h2 = g.createLinearGradient(0, 210, 0, -30);
+  h2.addColorStop(0, 'rgba(96,32,168,0)');
+  h2.addColorStop(1, 'rgba(96,32,168,0.14)');
+  g.fillStyle = h2; g.fillRect(0, -30, W, 250);
+  g.globalCompositeOperation = 'source-over';
+
+  var nf = g.createLinearGradient(0, 900, 0, 1080);
+  nf.addColorStop(0, 'rgba(9,3,20,0)');
+  nf.addColorStop(1, 'rgba(9,3,20,0.52)');
+  g.fillStyle = nf; g.fillRect(0, 900, W, 180);
+
+  var tf = g.createLinearGradient(0, 120, 0, 0);
+  tf.addColorStop(0, 'rgba(9,3,20,0)');
+  tf.addColorStop(1, 'rgba(9,3,20,0.30)');
+  g.fillStyle = tf; g.fillRect(0, 0, W, 120);
+
+  var vg = g.createRadialGradient(960, 540, 560, 960, 540, 1220);
+  vg.addColorStop(0, 'rgba(9,3,20,0)');
+  vg.addColorStop(1, 'rgba(9,3,20,0.74)');
+  g.fillStyle = vg; g.fillRect(0, 0, W, H);
+}
+buildGrade();
+
+// ---------------------------------------------------------------- population
+var G = [];
+function pickTint(i) {
+  var r = rnd(i, 51);
+  for (var k = 0; k < 6; k++) if (r < TINT_CUM[k]) return k;
+  return 0;
+}
+function newGhost(i, kind) {
+  return {
+    i: i, kind: kind, X: 0, Z: 2, gx: 0, gy: 0, h: 20, bob: 0, bobN: 0,
+    dirX: rndr(i, 55, -1, 1), dirZ: rndr(i, 56, -1, 1), flip: rnd(i, 57) < 0.5,
+    tint: pickTint(i), size: rndr(i, 65, 0.90, 1.10),
+    v: rndr(i, 61, 0.030, 0.072), bobHz: rndr(i, 63, 1.6, 2.5), bobPh: rnd(i, 64) * 6.2832,
+    goalX: 0, goalZ: 2, goalN: 1, idle: 0, solo: false, purposeful: rnd(i, 67) < 0.14,
+    qmin: 1.03 + Math.pow(rnd(i, 68), 0.55) * 1.55,
+    speedNow: 0, pinned: false, alphaMul: 1, nbr: 0, pairId: 0, qk: 0
+  };
+}
+
+var NFIELD = 192;
+var LONERS = [[35, 44], [1886, 32], [30, 152], [1898, 141], [26, 332],
+              [1893, 302], [46, 560], [1878, 520], [72, 878], [1848, 918]];
+var CROPS = [[356, 1112], [1664, 1102]];
+
+for (var i = 0; i < NFIELD; i++) {
+  var g = newGhost(i, 'field');
+  var u = (i + 0.5) / NFIELD;
+  var gy0 = 1160 - (1 - Math.pow(1 - u, 1.25)) * 1180;
+  var gy = clamp(gy0 + rndr(i, 11, -18, 18) + rndr(i, 12, -0.05, 0.05) * gy0, -14, 1170);
+  var Z = clamp(zOf(gy), ZMIN, ZMAX);
+  var band = Math.floor(u * 8);
+  var ncl = 3 + Math.floor(hash(band * 7 + 3) * 4);
+  var c = Math.floor(rnd(i, 21) * ncl);
+  var cx = ((c + 0.5) / ncl * 2 - 1) * 0.92 + rndr(band * 31 + c, 41, -0.17, 0.17);
+  var spread = 0.08 + rnd(band * 31 + c, 43) * 0.19;
+  var fx = cx + (rnd(i, 23) + rnd(i, 24) + rnd(i, 25) - 1.5) * spread;
+  g.Z = Z;
+  g.X = clamp(fx, -1.02, 1.02) * Xv(Z);
+  g.goalX = g.X; g.goalZ = g.Z;
+  G.push(g);
+}
+for (var k = 0; k < LONERS.length; k++) {
+  var gl = G[NFIELD - 1 - k];
+  gl.solo = true;
+  var w = toWorld(LONERS[k][0], LONERS[k][1]);
+  gl.X = w[0]; gl.Z = clamp(w[1], ZMIN, ZMAX);
+  gl.goalX = gl.X; gl.goalZ = gl.Z;
+}
+for (var k = 0; k < CROPS.length; k++) {
+  var gc = G[NFIELD - 1 - LONERS.length - k];
+  gc.kind = 'crop'; gc.pinned = true; gc.solo = false; gc.flip = k === 1;
+  var wc = toWorld(CROPS[k][0], CROPS[k][1]);
+  gc.X = wc[0]; gc.Z = wc[1];
+}
+
+// initial relax: pairwise separation, then push everyone out of the plaza
+(function () {
+  var msep = 0.078;
+  function relax(iters) {
+    for (var it = 0; it < iters; it++) {
+      for (var a = 0; a < NFIELD; a++) {
+        var A = G[a];
+        if (A.pinned) continue;
+        for (var bI = a + 1; bI < NFIELD; bI++) {
+          var B = G[bI];
+          var dx = A.X - B.X, dz = A.Z - B.Z;
+          var d2 = dx * dx + dz * dz;
+          if (d2 > msep * msep || d2 < 1e-9) continue;
+          var d = Math.sqrt(d2), f = (msep - d) / d * 0.5;
+          A.X += dx * f; A.Z += dz * f;
+          if (!B.pinned) { B.X -= dx * f; B.Z -= dz * f; }
+        }
+      }
+    }
+  }
+  function pushOut(tries) {
+    for (var a2 = 0; a2 < NFIELD; a2++) {
+      var P = G[a2];
+      if (P.kind === 'crop') continue;
+      for (var t = 0; t < tries; t++) {
+        var sx = sxOf(P.X, P.Z), sy2 = syOf(P.Z);
+        var nx = (sx - KCX) / KA, ny = (sy2 - KCY) / KB;
+        var q = Math.pow(Math.abs(nx), KN) + Math.pow(Math.abs(ny), KN);
+        if (q >= P.qmin) break;
+        var gx1 = KN * Math.sign(nx) * Math.pow(Math.abs(nx), KN - 1) / KA;
+        var gy1 = KN * Math.sign(ny) * Math.pow(Math.abs(ny), KN - 1) / KB;
+        var L = Math.hypot(gx1, gy1);
+        if (L < 1e-9) { gx1 = rndr(P.i, 69, -1, 1); gy1 = 1; L = Math.hypot(gx1, gy1); }
+        P.X += gx1 / L * 9 * P.Z / FOC;
+        P.Z += -gy1 / L * 9 * P.Z * P.Z / FOC;
+        P.Z = clamp(P.Z, ZMIN, ZMAX);
+        var lim = Xv(P.Z) * 1.02;
+        P.X = clamp(P.X, -lim, lim);
+      }
+      P.goalX = P.X; P.goalZ = P.Z;
+    }
+  }
+  relax(8); pushOut(110); relax(6); pushOut(40);
+})();
+
+// audience ring: equal-arclength along the plaza rim, open at the bottom
+var RING0 = G.length;
+(function () {
+  var STEPS = 720, pts = [], cum = [0];
+  var th0 = -28 * Math.PI / 180, th1 = 208 * Math.PI / 180;
+  for (var s = 0; s <= STEPS; s++) pts.push(superPt(th0 + (th1 - th0) * s / STEPS, 1.10));
+  for (var s2 = 1; s2 <= STEPS; s2++) {
+    cum.push(cum[s2 - 1] + Math.hypot(pts[s2][0] - pts[s2 - 1][0], pts[s2][1] - pts[s2 - 1][1]));
+  }
+  var total = cum[STEPS], SLOTS = 17;
+  for (var k2 = 0; k2 < SLOTS; k2++) {
+    if (rnd(k2, 301) < 0.20) continue;
+    var want = clamp(total * (k2 + 0.5 + rndr(k2, 303, -0.34, 0.34)) / SLOTS, 0, total);
+    var lo = 0;
+    while (lo < STEPS && cum[lo + 1] < want) lo++;
+    var f = (want - cum[lo]) / Math.max(1e-6, cum[lo + 1] - cum[lo]);
+    var thq = th0 + (th1 - th0) * (lo + f) / STEPS;
+    var p = superPt(thq, rndr(k2, 304, 1.02, 1.21));
+    var gg = newGhost(700 + k2, 'ring');
+    gg.pinned = true;
+    var wr = toWorld(p[0], p[1]);
+    gg.X = wr[0]; gg.Z = clamp(wr[1], ZMIN, ZMAX);
+    gg.flip = gg.X > 0;
+    G.push(gg);
+  }
+})();
+
+// queue, entering off-frame left and walking the iso diagonal to the plaza rim
+var QSCREEN = [[-70, 296], [70, 356], [162, 414], [232, 472], [280, 530], [312, 588]];
+var QP = [], QCUM = [0];
+for (var qi = 0; qi < QSCREEN.length; qi++) QP.push(toWorld(QSCREEN[qi][0], QSCREEN[qi][1]));
+for (var qi = 1; qi < QP.length; qi++) {
+  QCUM.push(QCUM[qi - 1] + Math.hypot(QP[qi][0] - QP[qi - 1][0], QP[qi][1] - QP[qi - 1][1]));
+}
+var QLEN = QCUM[QCUM.length - 1];
+function queueAt(s) {
+  if (s <= 0) return QP[0];
+  if (s >= QLEN) return QP[QP.length - 1];
+  var k = 0;
+  while (k < QCUM.length - 2 && QCUM[k + 1] < s) k++;
+  var f = (s - QCUM[k]) / (QCUM[k + 1] - QCUM[k]);
+  return [QP[k][0] + (QP[k + 1][0] - QP[k][0]) * f, QP[k][1] + (QP[k + 1][1] - QP[k][1]) * f];
+}
+var NQ = 9, QSP = QLEN / NQ;
+var QUEUE0 = G.length;
+for (var k3 = 0; k3 < NQ; k3++) {
+  var gq = newGhost(800 + k3, 'queue');
+  gq.pinned = true; gq.flip = false; gq.qk = k3;
+  G.push(gq);
+}
+
+// pairs, stopped and facing each other
+var PAIRS = [[190, 420], [1706, 452], [432, 848], [1520, 800]];
+var PAIR0 = G.length;
+for (var p2 = 0; p2 < PAIRS.length; p2++) {
+  var psy = PAIRS[p2][1];
+  var ph = hOf(zOf(psy));
+  var sep = ph * 1.65;
+  var wa = toWorld(PAIRS[p2][0] - sep / 2, psy);
+  var wb = toWorld(PAIRS[p2][0] + sep / 2, psy);
+  var ga = newGhost(900 + p2 * 2, 'pair');
+  ga.pinned = true; ga.X = wa[0]; ga.Z = wa[1]; ga.flip = false; ga.pairId = p2;
+  var gb = newGhost(901 + p2 * 2, 'pair');
+  gb.pinned = true; gb.X = wb[0]; gb.Z = wb[1]; gb.flip = true; gb.pairId = p2;
+  G.push(ga); G.push(gb);
+}
+var NPAIR = PAIRS.length * 2;
+var N = G.length;
+
+// ---------------------------------------------------------------- hash grid
+var CELL = 0.11, GX0 = -3.4, GZ0 = 1.05, GNX = 64, GNZ = 44;
+var head = new Int32Array(GNX * GNZ);
+var nxt = new Int32Array(N);
+function cellIdx(X, Z) {
+  var cx = Math.floor((X - GX0) / CELL), cz = Math.floor((Z - GZ0) / CELL);
+  if (cx < 0) cx = 0; else if (cx >= GNX) cx = GNX - 1;
+  if (cz < 0) cz = 0; else if (cz >= GNZ) cz = GNZ - 1;
+  return cz * GNX + cx;
+}
+
+// ---------------------------------------------------------------- sim
+var T = 0, MSEP = 0.078;
+
+function step(dt) {
+  head.fill(-1);
+  for (var i = 0; i < N; i++) {
+    var c = cellIdx(G[i].X, G[i].Z);
+    nxt[i] = head[c]; head[c] = i;
+  }
+
+  for (var i2 = 0; i2 < N; i2++) {
+    var g = G[i2];
+    if (g.pinned) { g.speedNow = 0; continue; }
+
+    var dgx = g.goalX - g.X, dgz = g.goalZ - g.Z;
+    var dg = Math.hypot(dgx, dgz);
+    if (g.idle > 0) {
+      g.idle -= dt;
+    } else if (dg < 0.04) {
+      g.goalN++;
+      // goals are drawn in SCREEN space: a world-space random walk equilibrates
+      // to world-uniform density, which visibly drains the near band over 60s.
+      var rX = g.purposeful ? 520 : 190, rY = g.purposeful ? 330 : 145;
+      var nsx = sxOf(g.X, g.Z) + rndr(g.i, g.goalN * 7 + 31, -rX, rX);
+      var nsy = clamp(syOf(g.Z) + rndr(g.i, g.goalN * 7 + 32, -rY, rY), -26, 1168);
+      var nZ = clamp(zOf(nsy), ZMIN + 0.02, ZMAX - 0.02);
+      var nX = (nsx - 960) * nZ / FOC;
+      var lim = Xv(nZ) * 1.02;
+      if (g.solo) {
+        var minAbs = 0.68 * Xv(nZ);
+        if (Math.abs(nX) < minAbs) nX = (nX >= 0 ? 1 : -1) * minAbs;
+      }
+      nX = clamp(nX, -lim, lim);
+      // and never aim into the plaza — a goal inside it parks the ghost against
+      // the keep-out boundary and builds a wall of bodies around the type
+      for (var gt = 0; gt < 14; gt++) {
+        var qsx = sxOf(nX, nZ), qsy = syOf(nZ);
+        var qnx = (qsx - KCX) / KA, qny = (qsy - KCY) / KB;
+        var qq = Math.pow(Math.abs(qnx), KN) + Math.pow(Math.abs(qny), KN);
+        if (qq >= g.qmin) break;
+        var qgx = KN * Math.sign(qnx) * Math.pow(Math.abs(qnx), KN - 1) / KA;
+        var qgy = KN * Math.sign(qny) * Math.pow(Math.abs(qny), KN - 1) / KB;
+        var qL = Math.hypot(qgx, qgy);
+        if (qL < 1e-9) { qgx = 0; qgy = 1; qL = 1; }
+        nX += qgx / qL * 26 * nZ / FOC;
+        nZ = clamp(nZ - qgy / qL * 26 * nZ * nZ / FOC, ZMIN + 0.02, ZMAX - 0.02);
+        nX = clamp(nX, -Xv(nZ) * 1.02, Xv(nZ) * 1.02);
+      }
+      g.goalX = nX;
+      g.goalZ = nZ;
+      if (rnd(g.i, g.goalN * 7 + 33) < 0.26) g.idle = rndr(g.i, g.goalN * 7 + 34, 1.2, 4.2);
+      dgx = g.goalX - g.X; dgz = g.goalZ - g.Z; dg = Math.hypot(dgx, dgz);
+    }
+    var dx = dg > 1e-6 ? dgx / dg : 0, dz = dg > 1e-6 ? dgz / dg : 0;
+
+    var pushX = 0, pushZ = 0, nbr = 0;
+    var msep = g.solo ? MSEP * 3.2 : MSEP;
+    var ccx = Math.floor((g.X - GX0) / CELL), ccz = Math.floor((g.Z - GZ0) / CELL);
+    var span = g.solo ? 3 : 1;
+    for (var oz = -span; oz <= span; oz++) {
+      var rz = ccz + oz;
+      if (rz < 0 || rz >= GNZ) continue;
+      for (var ox = -span; ox <= span; ox++) {
+        var rx2 = ccx + ox;
+        if (rx2 < 0 || rx2 >= GNX) continue;
+        var j = head[rz * GNX + rx2];
+        while (j !== -1) {
+          if (j !== i2) {
+            var o = G[j];
+            var sx1 = g.X - o.X, sz1 = g.Z - o.Z;
+            var d2 = sx1 * sx1 + sz1 * sz1;
+            if (d2 < msep * msep && d2 > 1e-9) {
+              var d = Math.sqrt(d2);
+              pushX += sx1 / d * (msep - d) * 2.2;
+              pushZ += sz1 / d * (msep - d) * 2.2;
+              nbr++;
+            }
+          }
+          j = nxt[j];
+        }
+      }
+    }
+    g.nbr = nbr;
+
+    var sx2 = sxOf(g.X, g.Z), sy2 = syOf(g.Z);
+    var nx = (sx2 - KCX) / KA, ny = (sy2 - KCY) / KB;
+    var q = Math.pow(Math.abs(nx), KN) + Math.pow(Math.abs(ny), KN);
+    var plX = 0, plZ = 0;
+    var qOut = g.qmin + 0.30;
+    if (q < qOut) {
+      var ggx = KN * Math.sign(nx) * Math.pow(Math.abs(nx), KN - 1) / KA;
+      var ggy = KN * Math.sign(ny) * Math.pow(Math.abs(ny), KN - 1) / KB;
+      var L = Math.hypot(ggx, ggy);
+      var px, py;
+      if (q < 1e-4 || L < 1e-9) { px = 0; py = 1; } else { px = ggx / L; py = ggy / L; }
+      var F = clamp((qOut - q) / 0.30, 0, 1) * 2.8;
+      var wX = px * g.Z / FOC, wZ = -py * g.Z * g.Z / FOC;
+      var wL = Math.hypot(wX, wZ);
+      if (wL > 1e-9) { plX = wX / wL * F; plZ = wZ / wL * F; }
+    }
+
+    var bX = 0, bZ = 0;
+    var lim2 = Xv(g.Z) * 1.02;
+    if (g.X > lim2) bX -= (g.X - lim2) * 12;
+    else if (g.X < -lim2) bX += (-lim2 - g.X) * 12;
+    if (g.Z < ZMIN + 0.04) bZ += (ZMIN + 0.04 - g.Z) * 12;
+    else if (g.Z > ZMAX - 0.04) bZ -= (g.Z - ZMAX + 0.04) * 12;
+
+    var flX = 0.55 * Math.sin(0.85 * g.Z + 0.30) * Math.cos(0.80 * g.X - 0.15);
+    var flZ = -0.38 * Math.cos(0.90 * g.X + 0.90) * Math.sin(0.62 * g.Z);
+
+    var wx = dx + 0.55 * pushX + plX + bX + 0.13 * flX;
+    var wz = dz + 0.55 * pushZ + plZ + bZ + 0.13 * flZ;
+    var wl = Math.hypot(wx, wz);
+    if (wl > 1e-6) { wx /= wl; wz /= wl; }
+    g.dirX += (wx - g.dirX) * 0.14;
+    g.dirZ += (wz - g.dirZ) * 0.14;
+    var dl = Math.hypot(g.dirX, g.dirZ);
+    if (dl > 1e-6) { g.dirX /= dl; g.dirZ /= dl; }
+
+    g.speedNow = (g.idle > 0 ? 0 : g.v) * (1 - 0.4 * clamp(nbr / 6, 0, 1));
+    g.X += g.dirX * g.speedNow * dt;
+    g.Z += g.dirZ * g.speedNow * dt;
+    g.Z = clamp(g.Z, ZMIN, ZMAX);
+
+    if (Math.abs(g.dirX) > 0.18) g.flip = g.dirX < 0;
+  }
+
+  for (var k = 0; k < NQ; k++) {
+    var gq = G[QUEUE0 + k];
+    var tt = T - k * 0.28;
+    var Pk = 0.030 * tt + 0.026 * Math.sin(tt * 1.05);
+    var s = (Pk - k * QSP) % QLEN;
+    if (s < 0) s += QLEN;
+    var wp = queueAt(s);
+    gq.X = wp[0]; gq.Z = wp[1];
+    gq.alphaMul = clamp(s / (QLEN * 0.10), 0, 1) * clamp((QLEN - s) / (QLEN * 0.12), 0, 1);
+    gq.speedNow = 0.030;
+  }
+  T += dt;
+}
+
+var order = [];
+for (var oi = 0; oi < N; oi++) order.push(G[oi]);
+
+function project() {
+  for (var i = 0; i < N; i++) {
+    var g = G[i];
+    g.gx = sxOf(g.X, g.Z);
+    g.gy = syOf(g.Z);
+    g.h = hOf(g.Z) * g.size;
+    var bn;
+    if (g.kind === 'queue') {
+      bn = Math.abs(Math.sin(T * g.bobHz * Math.PI + g.bobPh));
+    } else if (g.pinned || g.speedNow <= 1e-5) {
+      bn = 0.36 * Math.abs(Math.sin(T * 1.1 + g.bobPh));
+      if (g.kind === 'pair' && ((T + rnd(g.pairId, 81) * 14) % 14) < 0.8) bn *= 2.2;
+    } else {
+      bn = Math.abs(Math.sin(T * g.bobHz * Math.PI + g.bobPh)) * (g.speedNow / g.v);
+    }
+    g.bobN = bn;
+    g.bob = 0.055 * g.h * bn;
+  }
+  for (var a = 1; a < N; a++) {
+    var v = order[a], b = a - 1;
+    while (b >= 0 && order[b].gy > v.gy) { order[b + 1] = order[b]; b--; }
+    order[b + 1] = v;
+  }
+}
+
+// ---------------------------------------------------------------- speech
+var LINES = [
+  'did you read the spec?', "it's in steering.md", 'hooks fired again',
+  'I only did what you asked', 'requirements first', "that's out of scope",
+  'the design doc says no', 'who approved this task?', 'still generating...',
+  'ship it', 'nice diff', 'add it to the backlog', 'have you tried spec mode?',
+  'I wrote tests, actually', "that's a boundary", "so that's kiro"
+];
+function bubbleLine(k) {
+  // rotate through the 15 common lines so two on screen are never the same;
+  // the headline said back at the room is a rare find
+  if (rnd(k, 302) < 1 / 24) return LINES[15];
+  return LINES[(k + Math.floor(rnd(Math.floor(k / 15), 305) * 15)) % 15];
+}
+
+// ---------------------------------------------------------------- draw
+var LX = 2280, LY = -420;
+var B1 = 330, B2 = 900, FW = 20;
+function skewOf(gx) { return (gx - LX) / 1920 * 1.35; }
+function squishOf(gy) { return (gy - LY) / 1080 * 0.62; }
+
+function drawGhostInto(c, S, g, w, bi, k, GM) {
+  var blink = g.h >= 35 && (((T * 0.21 + rnd(g.i, 71)) % 1 + 1) % 1) < 0.030;
+  var pair = (blink && SPRB[bi][g.tint]) ? SPRB[bi][g.tint] : SPR[bi][g.tint];
+  var img = pair[g.flip ? 1 : 0];
+
+  var aer = 1 - 0.34 * clamp((g.Z - 1.7) / 3.4, 0, 1);
+  var A = aer * w * g.alphaMul;
+  if (A <= 0.004) return;
+
+  var rx = 0.32 * g.h, ry = Math.max(0.6, 0.32 * g.h / g.Z);
+  var bs = 1 - 0.22 * g.bobN;
+  c.globalAlpha = 0.44 * w * g.alphaMul * (1 - 0.28 * g.bobN);
+  c.drawImage(BLOB, g.gx - rx * bs, g.gy - ry * bs, 2 * rx * bs, 2 * ry * bs);
+
+  if (g.h >= 16) {
+    var sk = skewOf(g.gx), sq = squishOf(g.gy);
+    c.setTransform(S, 0, -sk * S, -sq * S, g.gx * S, g.gy * S);
+    c.globalAlpha = 0.36 * w * g.alphaMul;
+    c.drawImage(FADE[bi], -GM.ax * k, -GM.ay * k, GM.sw * k, GM.sh * k);
+    c.setTransform(S, 0, 0, S, 0, 0);
+  }
+
+  c.globalAlpha = A;
+  c.drawImage(img, g.gx - GM.ax * k, g.gy - GM.ay * k - g.bob, GM.sw * k, GM.sh * k);
+}
+
+var lastDrawMs = 0, simMs = 0, fps = 0, bubbleCount = 0;
+
+function blit(src, radius) {
+  SCRATCH.setTransform(1, 0, 0, 1, 0, 0);
+  SCRATCH.filter = 'none';
+  SCRATCH.clearRect(0, 0, SCRATCH.canvas.width, SCRATCH.canvas.height);
+  SCRATCH.filter = 'blur(' + (radius * BS).toFixed(2) + 'px)';
+  SCRATCH.drawImage(src.canvas, 0, 0);
+  SCRATCH.filter = 'none';
+  X0.drawImage(SCRATCH.canvas, 0, 0, main.width, main.height);
+}
+
+function draw() {
+  var t0 = performance.now();
+
+  SHADOW.setTransform(BS, 0, 0, BS, 0, 0);
+  FAR.setTransform(BS, 0, 0, BS, 0, 0);
+  NEAR.setTransform(BS, 0, 0, BS, 0, 0);
+  MID.setTransform(dpr, 0, 0, dpr, 0, 0);
+  SHADOW.clearRect(0, 0, W, H);
+  FAR.clearRect(0, 0, W, H);
+  MID.clearRect(0, 0, W, H);
+  NEAR.clearRect(0, 0, W, H);
+
+  var tsk = skewOf(960), tsq = squishOf(700);
+  SHADOW.setTransform(BS, 0, -tsk * BS, -tsq * BS, 960 * BS, 700 * BS);
+  SHADOW.globalAlpha = 0.46;
+  SHADOW.drawImage(TEXTSIL.canvas, -TAX, -TAY, TW, TH);
+  SHADOW.setTransform(BS, 0, 0, BS, 0, 0);
+
+  var i, g;
+  for (i = 0; i < N; i++) {
+    g = order[i];
+    var bi = bucketOf(g.h), GM = GEOM[bi], k = g.h / BUCKETS[bi];
+    var sk = skewOf(g.gx), sq = squishOf(g.gy);
+    SHADOW.setTransform(BS, 0, -sk * BS, -sq * BS, g.gx * BS, g.gy * BS);
+    SHADOW.globalAlpha = (0.72 - 0.30 * clamp((g.Z - 1.5) / 3.4, 0, 1)) * g.alphaMul;
+    SHADOW.drawImage(SIL[bi], -GM.ax * k, -GM.ay * k, GM.sw * k, GM.sh * k);
+  }
+  SHADOW.setTransform(BS, 0, 0, BS, 0, 0);
+  SHADOW.globalAlpha = 1;
+
+  for (i = 0; i < N; i++) {
+    g = order[i];
+    var bi2 = bucketOf(g.h), GM2 = GEOM[bi2], k2 = g.h / BUCKETS[bi2];
+    var gy = g.gy, wF = 0, wM = 0, wN = 0;
+    if (gy < B1 - FW) wF = 1;
+    else if (gy < B1 + FW) { var u1 = (gy - (B1 - FW)) / (2 * FW); wF = 1 - u1; wM = u1; }
+    else if (gy < B2 - FW) wM = 1;
+    else if (gy < B2 + FW) { var u2 = (gy - (B2 - FW)) / (2 * FW); wM = 1 - u2; wN = u2; }
+    else wN = 1;
+    if (wF > 0.004) drawGhostInto(FAR, BS, g, wF, bi2, k2, GM2);
+    if (wM > 0.004) drawGhostInto(MID, dpr, g, wM, bi2, k2, GM2);
+    if (wN > 0.004) drawGhostInto(NEAR, BS, g, wN, bi2, k2, GM2);
+  }
+
+  MID.setTransform(dpr, 0, -tsk * dpr, -tsq * dpr, 960 * dpr, 700 * dpr);
+  MID.globalAlpha = 0.26;
+  MID.drawImage(TEXTFADE.canvas, -TAX, -TAY, TW, TH);
+  MID.setTransform(dpr, 0, 0, dpr, 0, 0);
+  MID.globalAlpha = 1;
+  MID.drawImage(TEXT.canvas, TXO, TYO, TW, TH);
+
+  bubbleCount = 0;
+  var k0 = Math.floor((T - 2.8) / 0.62), k1 = Math.floor(T / 0.62);
+  MID.lineCap = 'round';
+  MID.textBaseline = 'alphabetic';
+  MID.font = '400 17px ' + FMONO;
+  var placed = [];
+  for (var kk = Math.max(0, k0); kk <= k1; kk++) {
+    var ts = kk * 0.62;
+    if (T < ts || T >= ts + 2.8) continue;
+    if (bubbleCount >= 3) break;
+    var line = bubbleLine(kk);
+    var tw = MID.measureText(line).width;
+    // try a few seeded speakers and both sides; a bubble that would land on
+    // the type, off the frame, or on another bubble is simply not spoken
+    var sp = null, side = 1, a1x, a1y, a2x, a2y, a3x, a3y, tx, ty, bx0, by0;
+    for (var att = 0; att < 10 && !sp; att++) {
+      var cand = (kk % 4 === 3)
+        ? G[PAIR0 + Math.floor(rnd(kk * 10 + att, 300) * NPAIR)]
+        : G[Math.floor(rnd(kk * 10 + att, 301) * NFIELD)];
+      if (!cand || cand.h < 26 || cand.gy > 995 || cand.gy < 290) continue;
+      var sd = (att & 1) ? -1 : 1;
+      if (rnd(kk, 303) < 0.5) sd = -sd;
+      var hx = cand.gx, hy = cand.gy - 1.02 * cand.h - cand.bob;
+      var L = Math.max(cand.h, 34);
+      a1x = hx + sd * 0.120 * L; a1y = hy - 0.209 * L;
+      a2x = hx + sd * 0.170 * L; a2y = hy - 0.470 * L;
+      a3x = a2x + sd * 0.261 * L; a3y = a2y - 0.150 * L;
+      tx = a3x + sd * 5; ty = a3y - 6;
+      bx0 = sd > 0 ? tx : tx - tw; by0 = ty - 17;
+      if (bx0 < 1590 && bx0 + tw > 330 && by0 < 726 && by0 + 23 > 404) continue;
+      if (bx0 < 10 || bx0 + tw > 1910 || by0 < 320) continue;
+      var hit = false;
+      for (var pi = 0; pi < placed.length; pi++) {
+        var pb = placed[pi];
+        if (bx0 - 10 < pb[0] + pb[2] && bx0 + tw + 10 > pb[0] &&
+            by0 - 8 < pb[1] + 23 && by0 + 31 > pb[1]) { hit = true; break; }
+      }
+      if (hit) continue;
+      sp = cand; side = sd;
+    }
+    if (!sp) continue;
+    placed.push([bx0, by0, tw]);
+    var fade = clamp(Math.min(T - ts, ts + 2.8 - T) / 0.45, 0, 1);
+    MID.globalAlpha = fade;
+    MID.strokeStyle = 'rgba(217,194,255,0.62)';
+    MID.lineWidth = 1.4;
+    MID.beginPath();
+    MID.moveTo(a1x, a1y); MID.lineTo(a2x, a2y); MID.lineTo(a3x, a3y);
+    MID.stroke();
+    MID.textAlign = side > 0 ? 'left' : 'right';
+    MID.lineWidth = 4;
+    MID.lineJoin = 'round';
+    MID.strokeStyle = 'rgba(9,3,20,0.92)';
+    MID.strokeText(line, tx, ty);
+    MID.fillStyle = 'rgb(226,208,255)';
+    MID.fillText(line, tx, ty);
+    MID.textAlign = 'left';
+    MID.globalAlpha = 1;
+    bubbleCount++;
+  }
+
+  X0.setTransform(1, 0, 0, 1, 0, 0);
+  X0.globalAlpha = 1;
+  X0.filter = 'none';
+  X0.clearRect(0, 0, main.width, main.height);
+  X0.drawImage(GROUND.canvas, 0, 0, main.width, main.height);
+  blit(SHADOW, 2.8);
+  blit(FAR, 2.2);
+  X0.drawImage(MID.canvas, 0, 0, main.width, main.height);
+  blit(NEAR, 2.8);
+  X0.drawImage(GRADE.canvas, 0, 0, main.width, main.height);
+
+  lastDrawMs = performance.now() - t0;
+
+  if (DEBUG) {
+    var nf = 0, nm = 0, nn = 0, idle = 0;
+    for (i = 0; i < N; i++) {
+      if (order[i].gy < B1) nf++; else if (order[i].gy < B2) nm++; else nn++;
+      if (order[i].speedNow <= 1e-5) idle++;
+    }
+    X0.save();
+    X0.setTransform(dpr, 0, 0, dpr, 0, 0);
+    X0.fillStyle = 'rgba(9,3,20,0.78)';
+    X0.fillRect(12, 12, 320, 146);
+    X0.fillStyle = '#d9c2ff';
+    X0.font = '14px ' + FMONO;
+    var lines = [
+      't = ' + T.toFixed(2) + '    fps ' + fps.toFixed(1) + '    dpr ' + dpr,
+      'ghosts ' + N + '   far/mid/near ' + nf + '/' + nm + '/' + nn,
+      'still ' + idle + '   bubbles ' + bubbleCount,
+      'sim ' + simMs.toFixed(2) + ' ms   draw ' + lastDrawMs.toFixed(2) + ' ms',
+      'head ' + hSize + 'px  laid-out width ' + hLay.w.toFixed(0)
+    ];
+    for (var li = 0; li < lines.length; li++) X0.fillText(lines[li], 24, 38 + li * 22);
+    X0.restore();
+  }
+}
+
+// ---------------------------------------------------------------- run
+(function () {
+  var t0 = performance.now();
+  var steps = Math.ceil(T0 * 60);
+  for (var s = 0; s < steps; s++) step(1 / 60);
+  simMs = performance.now() - t0;
+})();
+project();
+draw();
+
+if (!FREEZE) {
+  var acc = 0, last = performance.now(), ema = 0;
+  requestAnimationFrame(function loop(now) {
+    var dt = Math.min(0.25, (now - last) / 1000);
+    last = now;
+    ema = ema ? ema * 0.9 + dt * 0.1 : dt;
+    fps = 1 / Math.max(1e-4, ema);
+    acc += dt;
+    var st = performance.now();
+    var n = 0;
+    while (acc >= 1 / 60 && n < 4) { step(1 / 60); acc -= 1 / 60; n++; }
+    if (acc > 1 / 60) acc = 0;
+    simMs = performance.now() - st;
+    project();
+    draw();
+    requestAnimationFrame(loop);
+  });
+}
+
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(function () {
+    buildText();
+    if (FREEZE) draw();
+  });
+}
+})();
+</script>
+</body>
+</html>
